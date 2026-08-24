@@ -9,6 +9,10 @@ folder layout and how to adapt dataset.py if your data isn't organized that way.
 """
 import argparse
 import time
+import os
+import csv
+import logging
+from contextlib import suppress
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +23,7 @@ from PIL import Image
 
 from dataset import PatchDataset
 from models import Generator, Discriminator
+import sys
 
 # --- ADDED FOR FID ---
 try:
@@ -61,6 +66,8 @@ def parse_args():
     p.add_argument("--label_smoothing", type=float, default=0.9,
                     help="'Real' label value fed to the discriminator loss (1.0 = off).")
     p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--max_batches_per_epoch", type=int, default=0,
+                    help="For quick dev runs: process at most this many batches per epoch (0 = no limit)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default=None,
                     help="'cuda', 'mps', or 'cpu'. Auto-detected if not set.")
@@ -72,7 +79,7 @@ def parse_args():
     p.add_argument("--samples_per_class", type=int, default=4)
     
     # --- ADDED FOR FID ---
-    p.add_argument("--eval_fid_every", type=int, default=5, 
+    p.add_argument("--eval_fid_every", type=int, default=1, 
                     help="Evaluate FID every N epochs (0 to disable). Requires torchmetrics.")
     p.add_argument("--fid_samples", type=int, default=2048, 
                     help="Max number of samples to use for computing FID (standard is 50k, but 2k-5k is faster for intermediate checks).")
@@ -168,6 +175,23 @@ def main():
     (out_dir / "samples").mkdir(parents=True, exist_ok=True)
     (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
 
+    # Logging setup: both console and file
+    log_path = out_dir / "train.log"
+    csv_path = out_dir / "training_log.csv"
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s: %(message)s",
+                        handlers=[logging.StreamHandler(sys.stdout),
+                                  logging.FileHandler(log_path, mode="a")])
+    logger = logging.getLogger("train")
+    logger.info(f"Logging to {log_path}")
+
+    # Write PID file so users can check if the process is running
+    pid_path = out_dir / "train.pid"
+    try:
+        pid_path.write_text(str(os.getpid()))
+    except Exception:
+        logger.debug("Could not write PID file.")
+
     dataset = PatchDataset(
         args.data_dir, num_classes=args.num_classes,
         images_subdir=args.images_subdir, masks_subdir=args.masks_subdir,
@@ -204,14 +228,42 @@ def main():
         start_epoch = ckpt["epoch"] + 1
         print(f"[train] Resumed from {args.resume} at epoch {start_epoch}")
 
-    print(f"[train] {len(dataset)} patches/epoch, batch_size={args.batch_size}, "
-          f"patch_size={args.patch_size}, num_classes={args.num_classes}")
+    logger.info(f"[train] {len(dataset)} patches/epoch, batch_size={args.batch_size}, "
+                f"patch_size={args.patch_size}, num_classes={args.num_classes}")
 
-    for epoch in range(start_epoch, args.epochs):
+    # Setup CSV header if needed
+    if not csv_path.exists():
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["epoch", "d_loss", "g_loss", "fid", "epoch_time_s"]) 
+    logger.info(f"Training CSV log at {csv_path}")
+
+    # Prefer tqdm for a nicer progress bar if available; fallback to simple loop
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        tqdm = None
+
+    epoch_iter = range(start_epoch, args.epochs)
+    if tqdm is not None:
+        epoch_iter = tqdm(epoch_iter, desc="epochs", unit="epoch")
+
+    for epoch in epoch_iter:
         t0 = time.time()
         running_d, running_g, n_batches = 0.0, 0.0, 0
 
-        for real_imgs, labels in loader:
+        logger.info(f"Starting epoch {epoch+1}/{args.epochs}")
+
+        # per-batch progress bar (if tqdm available)
+        batch_iter = loader
+        if tqdm is not None:
+            try:
+                total_batches = len(loader)
+            except Exception:
+                total_batches = None
+            batch_iter = tqdm(loader, desc=f"epoch {epoch+1}", total=total_batches, leave=False)
+
+        for real_imgs, labels in batch_iter:
             real_imgs = real_imgs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             bs = real_imgs.size(0)
@@ -242,22 +294,43 @@ def main():
             running_d += d_loss.item()
             running_g += g_loss.item()
             n_batches += 1
+            # optional early-exit for dev runs
+            if args.max_batches_per_epoch > 0 and n_batches >= args.max_batches_per_epoch:
+                break
 
         dt = time.time() - t0
-        print(f"[epoch {epoch+1}/{args.epochs}] D_loss={running_d/n_batches:.4f} "
-              f"G_loss={running_g/n_batches:.4f} ({dt:.1f}s)")
+        mean_d = running_d / n_batches if n_batches else float('nan')
+        mean_g = running_g / n_batches if n_batches else float('nan')
+        logger.info(f"[epoch {epoch+1}/{args.epochs}] D_loss={mean_d:.4f} G_loss={mean_g:.4f} ({dt:.1f}s)")
+
+        # --- ADDED FOR FID ---
+        fid_score = None
+        if args.eval_fid_every > 0 and (epoch + 1) % args.eval_fid_every == 0:
+            try:
+                fid_score = evaluate_fid(G, loader, fid_metric, args.latent_dim, device, args.fid_samples)
+                logger.info(f"  --> FID Score: {fid_score:.4f}")
+            except Exception as e:
+                logger.exception("Error while computing FID")
+        # ---------------------
+
+        # Update progress bar postfix if available
+        if tqdm is not None and hasattr(epoch_iter, "set_postfix"):
+            try:
+                epoch_iter.set_postfix({"D_loss": f"{mean_d:.4f}", "G_loss": f"{mean_g:.4f}", "FID": f"{fid_score if fid_score is not None else 'NA'}"})
+            except Exception:
+                pass
+
+        # Append to CSV log
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([epoch + 1, f"{mean_d:.6f}", f"{mean_g:.6f}", f"{fid_score:.6f}" if fid_score is not None else "", f"{dt:.3f}"])
 
         if (epoch + 1) % args.sample_every == 0:
             sample_path = out_dir / "samples" / f"epoch_{epoch+1:04d}.png"
             save_sample_grid(G, args.num_classes, args.samples_per_class,
                               args.latent_dim, device, sample_path)
-            print(f"  saved sample grid -> {sample_path}")
-
-        # --- ADDED FOR FID ---
-        if args.eval_fid_every > 0 and (epoch + 1) % args.eval_fid_every == 0:
-            fid_score = evaluate_fid(G, loader, fid_metric, args.latent_dim, device, args.fid_samples)
-            print(f"  --> FID Score: {fid_score:.4f}")
-        # ---------------------
+            logger.info(f"  saved sample grid -> {sample_path}")
+        
 
         if (epoch + 1) % args.checkpoint_every == 0 or (epoch + 1) == args.epochs:
             ckpt_path = out_dir / "checkpoints" / f"ckpt_epoch_{epoch+1:04d}.pt"

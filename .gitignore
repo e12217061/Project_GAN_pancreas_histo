@@ -2,3 +2,4 @@
 /gan_outputs
 /make_dummy_data.py
 /__pycache__
+dataset/
