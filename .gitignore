@@ -4,3 +4,4 @@
 /__pycache__
 dataset/
 prev_runs/
+.env

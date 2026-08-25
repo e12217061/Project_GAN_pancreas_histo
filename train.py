@@ -11,6 +11,7 @@ import argparse
 import time
 import os
 import csv
+import copy
 import logging
 from contextlib import suppress
 from pathlib import Path
@@ -18,11 +19,14 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from PIL import Image
 
 from dataset import PatchDataset
 from models import Generator, Discriminator
+from gitlogger import GitHubLogger
+from dotenv import load_dotenv
 import sys
 
 # --- ADDED FOR FID ---
@@ -74,8 +78,21 @@ def parse_args():
                     help="Apply the R1 penalty only every N discriminator steps (lazy "
                          "regularization, scaled to compensate) -- cheaper than every "
                          "step with a very similar effect. Set to 1 to apply every step.")
+    p.add_argument("--ema_decay", type=float, default=0.995,
+                    help="Decay for the exponential moving average of G's weights. The "
+                         "EMA copy is what's used for sample grids, FID, and the "
+                         "best-FID checkpoint -- it smooths out exactly the kind of "
+                         "epoch-to-epoch quality swings a raw GAN checkpoint can have. "
+                         "Lower (e.g. 0.99) adapts faster if you only get a few hundred "
+                         "total steps; higher (0.999) is standard for long runs.")
+    p.add_argument("--lr_decay_start_frac", type=float, default=0.5,
+                    help="Fraction of total --epochs after which LR starts linearly "
+                         "decaying (both G and D). 0.5 with --epochs 100 means constant "
+                         "LR for 50 epochs, then decay.")
+    p.add_argument("--lr_min_factor", type=float, default=0.1,
+                    help="LR at the final epoch, as a fraction of the initial --lr.")
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--max_batches_per_epoch", type=int, default=0,
+    p.add_argument("--max_batches_per_epoch", type=int, default=5,
                     help="For quick dev runs: process at most this many batches per epoch (0 = no limit)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default=None,
@@ -83,7 +100,7 @@ def parse_args():
     # output
     p.add_argument("--output_dir", type=str, default="./gan_outputs")
     p.add_argument("--sample_every", type=int, default=1, help="Save a sample grid every N epochs.")
-    p.add_argument("--checkpoint_every", type=int, default=10, help="Save a checkpoint every N epochs.")
+    p.add_argument("--checkpoint_every", type=int, default=3, help="Save a checkpoint every N epochs.")
     p.add_argument("--resume", type=str, default=None, help="Path to a checkpoint .pt to resume from.")
     p.add_argument("--samples_per_class", type=int, default=4)
     
@@ -138,6 +155,49 @@ def r1_penalty(real_imgs, d_real):
 # ---------------------
 
 
+# --- ADDED FOR EMA ---
+def update_ema(ema_model, model, decay):
+    """In-place EMA update of ema_model's parameters toward model's current parameters.
+    Buffers (e.g. BatchNorm running stats) are copied directly rather than EMA'd, since
+    they're already a running average themselves."""
+    with torch.no_grad():
+        for ema_p, p in zip(ema_model.parameters(), model.parameters()):
+            ema_p.mul_(decay).add_(p.detach(), alpha=1 - decay)
+        for ema_b, b in zip(ema_model.buffers(), model.buffers()):
+            ema_b.copy_(b)
+# ---------------------
+
+
+# --- ADDED FOR CLASS-EMBEDDING COLLAPSE MONITORING ---
+def embedding_collapse_metric(embed_weight):
+    """Mean pairwise cosine similarity between class embedding vectors (off-diagonal
+    only). Close to 1.0 means the classes are becoming indistinguishable to the
+    generator -- a leading indicator of the cross-class texture collapse seen when D
+    overpowers G (same output regardless of the class label fed in)."""
+    w = F.normalize(embed_weight, dim=1)
+    sim = w @ w.t()
+    n = sim.shape[0]
+    if n < 2:
+        return float("nan")
+    off_diag_sum = sim.sum() - sim.diagonal().sum()
+    return (off_diag_sum / (n * (n - 1))).item()
+# ---------------------
+
+
+# --- ADDED FOR LR DECAY ---
+def make_lr_lambda(total_epochs, decay_start_frac, min_factor):
+    decay_start_epoch = int(total_epochs * decay_start_frac)
+
+    def lr_lambda(epoch):
+        if total_epochs <= decay_start_epoch or epoch < decay_start_epoch:
+            return 1.0
+        progress = (epoch - decay_start_epoch) / (total_epochs - decay_start_epoch)
+        return max(1.0 - (1.0 - min_factor) * progress, min_factor)
+
+    return lr_lambda
+# ---------------------
+
+
 # --- ADDED FOR FID ---
 def evaluate_fid(generator, dataloader, fid_metric, latent_dim, device, max_samples=2048):
     """Calculates FID score by generating fake images corresponding to the real dataloader distributions."""
@@ -182,6 +242,12 @@ def main():
     torch.manual_seed(args.seed)
     device = auto_device(args.device)
     print(f"[train] Using device: {device}")
+
+
+    load_dotenv()
+    gh_token =  os.environ.get("GITHUB_TOKEN")
+
+    gitlogger = GitHubLogger(token=gh_token, repo_name="e12217061/Project_GAN_pancreas_histo", issue_number=2)
 
     # --- ADDED FOR FID ---
     if args.eval_fid_every > 0:
@@ -234,11 +300,27 @@ def main():
                        base_channels=args.d_base_channels,
                        use_spectral_norm=not args.no_spectral_norm).to(device)
 
+    # --- ADDED FOR EMA ---
+    # G_ema is a smoothed copy of G's weights, never trained directly via gradients --
+    # it's what we sample from, evaluate FID on, and save as the "best" checkpoint.
+    G_ema = copy.deepcopy(G).to(device)
+    G_ema.eval()
+    for p in G_ema.parameters():
+        p.requires_grad_(False)
+    # ---------------------
+
     opt_g = torch.optim.Adam(G.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
     opt_d = torch.optim.Adam(D.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
     criterion = nn.BCEWithLogitsLoss()
 
+    # --- ADDED FOR LR DECAY ---
+    lr_lambda = make_lr_lambda(args.epochs, args.lr_decay_start_frac, args.lr_min_factor)
+    sched_g = torch.optim.lr_scheduler.LambdaLR(opt_g, lr_lambda)
+    sched_d = torch.optim.lr_scheduler.LambdaLR(opt_d, lr_lambda)
+    # ---------------------
+
     start_epoch = 0
+    best_fid = float("inf")  # --- ADDED FOR BEST-FID CHECKPOINTING ---
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         G.load_state_dict(ckpt["G"])
@@ -246,7 +328,18 @@ def main():
         opt_g.load_state_dict(ckpt["opt_g"])
         opt_d.load_state_dict(ckpt["opt_d"])
         start_epoch = ckpt["epoch"] + 1
-        print(f"[train] Resumed from {args.resume} at epoch {start_epoch}")
+        # backward-compatible: older checkpoints (before this update) won't have these
+        if "G_ema" in ckpt:
+            G_ema.load_state_dict(ckpt["G_ema"])
+        else:
+            G_ema.load_state_dict(G.state_dict())
+            logger.warning("Checkpoint has no G_ema -- reinitialized EMA from raw G.")
+        if "sched_g" in ckpt:
+            sched_g.load_state_dict(ckpt["sched_g"])
+            sched_d.load_state_dict(ckpt["sched_d"])
+        best_fid = ckpt.get("best_fid", float("inf"))
+        print(f"[train] Resumed from {args.resume} at epoch {start_epoch} "
+              f"(best_fid so far: {best_fid:.4f})")
 
     logger.info(f"[train] {len(dataset)} patches/epoch, batch_size={args.batch_size}, "
                 f"patch_size={args.patch_size}, num_classes={args.num_classes}")
@@ -255,7 +348,8 @@ def main():
     if not csv_path.exists():
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "d_loss", "g_loss", "r1", "fid", "epoch_time_s"]) 
+            writer.writerow(["epoch", "d_loss", "g_loss", "r1", "fid", "embed_sim", "lr",
+                              "epoch_time_s"])
     logger.info(f"Training CSV log at {csv_path}")
 
     # Prefer tqdm for a nicer progress bar if available; fallback to simple loop
@@ -332,6 +426,10 @@ def main():
             g_loss.backward()
             opt_g.step()
 
+            # --- ADDED FOR EMA ---
+            update_ema(G_ema, G, args.ema_decay)
+            # ---------------------
+
             running_d += d_loss.item()
             running_g += g_loss.item()
             n_batches += 1
@@ -343,15 +441,26 @@ def main():
         mean_d = running_d / n_batches if n_batches else float('nan')
         mean_g = running_g / n_batches if n_batches else float('nan')
         mean_r1 = running_r1 / n_r1 if n_r1 else float('nan')
-        logger.info(f"[epoch {epoch+1}/{args.epochs}] D_loss={mean_d:.4f} G_loss={mean_g:.4f} "
-                    f"R1={mean_r1:.4f} ({dt:.1f}s)")
 
-        # --- ADDED FOR FID ---
+        # --- ADDED FOR LR DECAY ---
+        sched_g.step()
+        sched_d.step()
+        current_lr = opt_g.param_groups[0]["lr"]
+        # ---------------------
+
+        # --- ADDED FOR CLASS-EMBEDDING COLLAPSE MONITORING ---
+        embed_sim = embedding_collapse_metric(G.label_embed.weight)
+        # ---------------------
+
+        logger.info(f"[epoch {epoch+1}/{args.epochs}] D_loss={mean_d:.4f} G_loss={mean_g:.4f} "
+                    f"R1={mean_r1:.4f} embed_sim={embed_sim:.4f} lr={current_lr:.6f} ({dt:.1f}s)")
+
+        # --- ADDED FOR FID (now evaluated on the EMA generator) ---
         fid_score = None
         if args.eval_fid_every > 0 and (epoch + 1) % args.eval_fid_every == 0:
             try:
-                fid_score = evaluate_fid(G, loader, fid_metric, args.latent_dim, device, args.fid_samples)
-                logger.info(f"  --> FID Score: {fid_score:.4f}")
+                fid_score = evaluate_fid(G_ema, loader, fid_metric, args.latent_dim, device, args.fid_samples)
+                logger.info(f"  --> FID Score (EMA): {fid_score:.4f}")
             except Exception as e:
                 logger.exception("Error while computing FID")
         # ---------------------
@@ -370,22 +479,44 @@ def main():
             writer = csv.writer(f)
             writer.writerow([epoch + 1, f"{mean_d:.6f}", f"{mean_g:.6f}",
                               f"{mean_r1:.6f}" if n_r1 else "",
-                              f"{fid_score:.6f}" if fid_score is not None else "", f"{dt:.3f}"])
+                              f"{fid_score:.6f}" if fid_score is not None else "",
+                              f"{embed_sim:.6f}", f"{current_lr:.8f}", f"{dt:.3f}"])
 
         if (epoch + 1) % args.sample_every == 0:
             sample_path = out_dir / "samples" / f"epoch_{epoch+1:04d}.png"
-            save_sample_grid(G, args.num_classes, args.samples_per_class,
+            save_sample_grid(G_ema, args.num_classes, args.samples_per_class,
                               args.latent_dim, device, sample_path)
-            logger.info(f"  saved sample grid -> {sample_path}")
-        
+            logger.info(f"  saved sample grid (EMA) -> {sample_path}")
+
+        # GITHUB LOGGING
+        gitlogger.log_epoch(epoch=epoch, d_loss=mean_d, g_loss=mean_g, fid_score=fid_score)
+
+        local_file_path = f"gan_outputs/samples/epoch_{epoch+1:04d}.png"
+        repo_destination_path = f"gan_outputs/samples/epoch_{epoch+1:04d}.png"
+        gitlogger.commit_file(local_file_path, repo_destination_path, commit_message="Upload Test")
+
+        def make_ckpt_dict():
+            return {
+                "epoch": epoch, "G": G.state_dict(), "D": D.state_dict(),
+                "G_ema": G_ema.state_dict(),
+                "opt_g": opt_g.state_dict(), "opt_d": opt_d.state_dict(),
+                "sched_g": sched_g.state_dict(), "sched_d": sched_d.state_dict(),
+                "best_fid": best_fid, "args": vars(args),
+            }
+
+        # --- ADDED FOR BEST-FID CHECKPOINTING ---
+        if fid_score is not None and fid_score < best_fid:
+            best_fid = fid_score
+            best_path = out_dir / "checkpoints" / "best_fid.pt"
+            ckpt_dict = make_ckpt_dict()
+            ckpt_dict["best_fid"] = best_fid
+            torch.save(ckpt_dict, best_path)
+            logger.info(f"  New best FID ({best_fid:.4f}) -> saved {best_path}")
+        # ---------------------
 
         if (epoch + 1) % args.checkpoint_every == 0 or (epoch + 1) == args.epochs:
             ckpt_path = out_dir / "checkpoints" / f"ckpt_epoch_{epoch+1:04d}.pt"
-            torch.save({
-                "epoch": epoch, "G": G.state_dict(), "D": D.state_dict(),
-                "opt_g": opt_g.state_dict(), "opt_d": opt_d.state_dict(),
-                "args": vars(args),
-            }, ckpt_path)
+            torch.save(make_ckpt_dict(), ckpt_path)
             print(f"  saved checkpoint -> {ckpt_path}")
 
     print("[train] Done.")
