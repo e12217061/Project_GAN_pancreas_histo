@@ -9,11 +9,14 @@ class GitHubLogger:
         self.repo = self.g.get_repo(repo_name)
         self.issue = self.repo.get_issue(number=issue_number)
         
-    def log_epoch(self, epoch, d_loss, g_loss, fid_score=None):
+    def log_epoch(self, epoch, d_loss, g_adv, g_l1, r1, lr, fid_score=None):
         """Creates a new comment on the issue with the epoch's results."""
         message = f"### 📊 Epoch {epoch}\n"
         message += f"* **Discriminator Loss**: `{d_loss:.4f}`\n"
-        message += f"* **Generator Loss**: `{g_loss:.4f}`\n"
+        message += f"* **Generator Adv Loss**: `{g_adv:.4f}`\n"
+        message += f"* **Generator L1 Loss**: `{g_l1:.4f}`\n"
+        message += f"* **R1 Penalty**: `{r1:.4f}`\n"
+        message += f"* **Learning Rate**: `{lr:.6f}`\n"
         
         if fid_score is not None:
             message += f"* **FID Score**: `{fid_score:.4f}`\n"
