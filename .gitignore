@@ -3,3 +3,4 @@
 /make_dummy_data.py
 /__pycache__
 dataset/
+prev_runs/

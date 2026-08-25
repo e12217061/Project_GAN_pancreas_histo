@@ -2,16 +2,22 @@
 models.py — a basic class-conditional DCGAN, sized dynamically for any target patch_size.
 
 Generator: latent vector + class embedding -> project to a small 4x4 feature map ->
-repeated ConvTranspose2d blocks (each doubles spatial size, halves channels) until we
-reach or exceed patch_size -> a final resize + refinement conv locks in the exact
-requested size (so patch_size doesn't need to be a power of two).
+repeated Upsample(nearest)+Conv2d blocks (each doubles spatial size, halves channels)
+until we reach or exceed patch_size -> a final resize + refinement conv locks in the
+exact requested size (so patch_size doesn't need to be a power of two). We use
+Upsample+Conv2d rather than ConvTranspose2d specifically to avoid the checkerboard
+artifacts transposed convolutions are known to produce (uneven kernel overlap) --
+this was showing up clearly in earlier sample grids.
 
 Discriminator: mirrors this with strided Conv2d blocks, conditioned on class by
-concatenating a constant per-class channel to the image. AdaptiveAvgPool2d at the end
-means it also works for any patch_size without manual size bookkeeping. Spectral norm
-is applied to the conv/linear layers by default -- it's a one-line addition that
-meaningfully helps stability once you push resolution up (e.g. towards 512x512), which
-plain DCGAN struggles with.
+concatenating a constant per-class channel to the image. A minibatch-stddev layer is
+inserted before the final classifier: it appends one extra channel containing the
+batch's feature stddev, so the discriminator can directly notice when a whole batch of
+generator outputs looks suspiciously uniform -- a direct countermeasure against mode
+collapse. AdaptiveAvgPool2d at the end means the whole thing also works for any
+patch_size without manual size bookkeeping. Spectral norm is applied to the conv/linear
+layers by default -- it's a one-line addition that meaningfully helps stability once
+you push resolution up (e.g. towards 512x512), which plain DCGAN struggles with.
 """
 import math
 
@@ -48,7 +54,8 @@ class Generator(nn.Module):
         for _ in range(self.n_blocks):
             out_ch = max(ch // 2, min_channels)
             blocks += [
-                nn.ConvTranspose2d(ch, out_ch, kernel_size=4, stride=2, padding=1, bias=False),
+                nn.Upsample(scale_factor=2, mode="nearest"),
+                nn.Conv2d(ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False),
                 nn.BatchNorm2d(out_ch),
                 nn.ReLU(inplace=True),
             ]
@@ -72,6 +79,23 @@ class Generator(nn.Module):
             x = F.interpolate(x, size=(self.patch_size, self.patch_size),
                                mode="bilinear", align_corners=False)
         return x
+
+
+class MinibatchStdDev(nn.Module):
+    """Appends one extra channel containing the batch's feature-map stddev, averaged
+    down to a single scalar and broadcast spatially. Simplified (single-group) version
+    of the ProGAN/StyleGAN minibatch-stddev layer -- lets the discriminator directly
+    notice when a whole batch of generator outputs is suspiciously uniform, which is
+    exactly what mode collapse looks like."""
+
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x):
+        std = torch.sqrt(x.var(dim=0, unbiased=False) + self.eps)  # (C, H, W)
+        mean_std = std.mean().view(1, 1, 1, 1).expand(x.size(0), 1, x.size(2), x.size(3))
+        return torch.cat([x, mean_std], dim=1)
 
 
 class Discriminator(nn.Module):
@@ -103,13 +127,16 @@ class Discriminator(nn.Module):
             ch = out_ch
             cur_size //= 2
         self.features = nn.Sequential(*blocks)
+        self.minibatch_stddev = MinibatchStdDev()
         self.pool = nn.AdaptiveAvgPool2d(min_spatial)
-        self.classifier = sn(nn.Linear(ch * min_spatial * min_spatial, 1))
+        # +1 input channel: the minibatch-stddev layer appends one extra feature map
+        self.classifier = sn(nn.Linear((ch + 1) * min_spatial * min_spatial, 1))
 
     def forward(self, img, labels):
         y = self.label_embed(labels).view(-1, 1, 1, 1).expand(-1, 1, img.shape[2], img.shape[3])
         x = torch.cat([img, y], dim=1)
         x = self.features(x)
+        x = self.minibatch_stddev(x)
         x = self.pool(x)
         x = x.flatten(1)
         return self.classifier(x)

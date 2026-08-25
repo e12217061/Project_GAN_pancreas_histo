@@ -65,6 +65,15 @@ def parse_args():
     p.add_argument("--beta2", type=float, default=0.999)
     p.add_argument("--label_smoothing", type=float, default=0.9,
                     help="'Real' label value fed to the discriminator loss (1.0 = off).")
+    p.add_argument("--r1_gamma", type=float, default=10.0,
+                    help="R1 gradient penalty weight on the discriminator (Mescheder et "
+                         "al. 2018). Pulls D's gradients toward zero near real images "
+                         "instead of letting it form sharp, easily-exploitable boundaries "
+                         "around a handful of memorized images. Set to 0 to disable.")
+    p.add_argument("--r1_every", type=int, default=16,
+                    help="Apply the R1 penalty only every N discriminator steps (lazy "
+                         "regularization, scaled to compensate) -- cheaper than every "
+                         "step with a very similar effect. Set to 1 to apply every step.")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--max_batches_per_epoch", type=int, default=0,
                     help="For quick dev runs: process at most this many batches per epoch (0 = no limit)")
@@ -116,6 +125,17 @@ def save_sample_grid(generator, num_classes, samples_per_class, latent_dim, devi
         for cidx, img in enumerate(imgs):
             grid[r * patch:(r + 1) * patch, cidx * patch:(cidx + 1) * patch] = img
     Image.fromarray(grid).save(path)
+
+
+# --- ADDED FOR R1 PENALTY ---
+def r1_penalty(real_imgs, d_real):
+    """Gradient penalty on D's output w.r.t. real images (Mescheder et al. 2018).
+    Requires real_imgs.requires_grad_(True) before D(real_imgs, ...) was called."""
+    grad_real = torch.autograd.grad(
+        outputs=d_real.sum(), inputs=real_imgs, create_graph=True
+    )[0]
+    return grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
+# ---------------------
 
 
 # --- ADDED FOR FID ---
@@ -235,7 +255,7 @@ def main():
     if not csv_path.exists():
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "d_loss", "g_loss", "fid", "epoch_time_s"]) 
+            writer.writerow(["epoch", "d_loss", "g_loss", "r1", "fid", "epoch_time_s"]) 
     logger.info(f"Training CSV log at {csv_path}")
 
     # Prefer tqdm for a nicer progress bar if available; fallback to simple loop
@@ -248,9 +268,12 @@ def main():
     if tqdm is not None:
         epoch_iter = tqdm(epoch_iter, desc="epochs", unit="epoch")
 
+    global_step = 0  # counts discriminator steps, used to schedule the lazy R1 penalty
+
     for epoch in epoch_iter:
         t0 = time.time()
         running_d, running_g, n_batches = 0.0, 0.0, 0
+        running_r1, n_r1 = 0.0, 0
 
         logger.info(f"Starting epoch {epoch+1}/{args.epochs}")
 
@@ -276,11 +299,29 @@ def main():
             z = torch.randn(bs, args.latent_dim, device=device)
             with torch.no_grad():
                 fake_imgs = G(z, labels)
+
+            # --- ADDED FOR R1 PENALTY ---
+            apply_r1 = args.r1_gamma > 0 and (global_step % args.r1_every == 0)
+            if apply_r1:
+                real_imgs.requires_grad_(True)
+            # ---------------------
+
             d_real = D(real_imgs, labels)
             d_fake = D(fake_imgs, labels)
             d_loss = criterion(d_real, real_target) + criterion(d_fake, fake_target)
+
+            # --- ADDED FOR R1 PENALTY ---
+            if apply_r1:
+                r1 = r1_penalty(real_imgs, d_real)
+                # scaled by r1_every to compensate for only applying it periodically
+                d_loss = d_loss + (args.r1_gamma / 2) * r1 * args.r1_every
+                running_r1 += r1.item()
+                n_r1 += 1
+            # ---------------------
+
             d_loss.backward()
             opt_d.step()
+            global_step += 1
 
             # --- Generator step ---
             opt_g.zero_grad(set_to_none=True)
@@ -301,7 +342,9 @@ def main():
         dt = time.time() - t0
         mean_d = running_d / n_batches if n_batches else float('nan')
         mean_g = running_g / n_batches if n_batches else float('nan')
-        logger.info(f"[epoch {epoch+1}/{args.epochs}] D_loss={mean_d:.4f} G_loss={mean_g:.4f} ({dt:.1f}s)")
+        mean_r1 = running_r1 / n_r1 if n_r1 else float('nan')
+        logger.info(f"[epoch {epoch+1}/{args.epochs}] D_loss={mean_d:.4f} G_loss={mean_g:.4f} "
+                    f"R1={mean_r1:.4f} ({dt:.1f}s)")
 
         # --- ADDED FOR FID ---
         fid_score = None
@@ -316,14 +359,18 @@ def main():
         # Update progress bar postfix if available
         if tqdm is not None and hasattr(epoch_iter, "set_postfix"):
             try:
-                epoch_iter.set_postfix({"D_loss": f"{mean_d:.4f}", "G_loss": f"{mean_g:.4f}", "FID": f"{fid_score if fid_score is not None else 'NA'}"})
+                epoch_iter.set_postfix({"D_loss": f"{mean_d:.4f}", "G_loss": f"{mean_g:.4f}",
+                                         "R1": f"{mean_r1:.4f}" if n_r1 else "NA",
+                                         "FID": f"{fid_score if fid_score is not None else 'NA'}"})
             except Exception:
                 pass
 
         # Append to CSV log
         with open(csv_path, "a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([epoch + 1, f"{mean_d:.6f}", f"{mean_g:.6f}", f"{fid_score:.6f}" if fid_score is not None else "", f"{dt:.3f}"])
+            writer.writerow([epoch + 1, f"{mean_d:.6f}", f"{mean_g:.6f}",
+                              f"{mean_r1:.6f}" if n_r1 else "",
+                              f"{fid_score:.6f}" if fid_score is not None else "", f"{dt:.3f}"])
 
         if (epoch + 1) % args.sample_every == 0:
             sample_path = out_dir / "samples" / f"epoch_{epoch+1:04d}.png"
