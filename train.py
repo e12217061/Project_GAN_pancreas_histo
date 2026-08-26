@@ -24,6 +24,8 @@ from PIL import Image
 from dataset import SpatialMaskDataset
 from models import UNetGenerator, PatchDiscriminator
 import sys
+from gitlogger import GitHubLogger
+from dotenv import load_dotenv
 
 try:
     from torchmetrics.image.fid import FrechetInceptionDistance
@@ -228,6 +230,13 @@ def main():
     torch.manual_seed(args.seed)
     device = auto_device(args.device)
     print(f"[train] Using device: {device}")
+
+
+    load_dotenv()
+    gh_token =  os.environ.get("GITHUB_TOKEN")
+
+    gitlogger = GitHubLogger(token=gh_token, repo_name="e12217061/Project_GAN_pancreas_histo", issue_number=2)
+
 
     if args.eval_fid_every > 0:
         if FrechetInceptionDistance is None:
@@ -434,9 +443,18 @@ def main():
                               f"{current_lr:.8f}", f"{dt:.3f}"])
 
         if (epoch + 1) % args.sample_every == 0:
-            sample_path = out_dir / "samples" / f"epoch_{epoch+1:04d}.png"
+            sample_path = out_dir / "samples" / f"epochpix2pixR2_{epoch+1:04d}.png"
             save_sample_grid(G_ema, sample_masks, sample_reals, device, sample_path)
             logger.info(f"  saved sample grid (mask | generated | real) -> {sample_path}")
+
+
+        #GitLogger
+        gitlogger.log_epoch(epoch=epoch+1, d_loss=mean_d, g_adv=mean_g_adv, g_l1=mean_g_l1, r1=mean_r1, lr=current_lr, fid_score=fid_score)
+
+        local_file_path = f"gan_outputs/samples/pix2pixR2_epoch_{epoch+1:04d}.png"
+        repo_destination_path = f"gan_outputs/samples/pix2pixR2_epoch_{epoch+1:04d}.png"
+        gitlogger.commit_file(local_file_path, repo_destination_path, commit_message="Upload")
+
 
         def make_ckpt_dict():
             return {
