@@ -36,7 +36,7 @@ class DownBlock(nn.Module):
         super().__init__()
         layers = [nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=not normalize)]
         if normalize:
-            layers.append(nn.BatchNorm2d(out_ch))
+            layers.append(nn.InstanceNorm2d(out_ch, affine=True))
         layers.append(nn.LeakyReLU(0.2, inplace=False))
         self.block = nn.Sequential(*layers)
 
@@ -56,7 +56,7 @@ class UpBlock(nn.Module):
             nn.ReLU(inplace=False),
             nn.Upsample(scale_factor=2, mode="nearest"),
             nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            nn.InstanceNorm2d(out_ch, affine=True),
         ]
         if dropout > 0:
             layers.append(nn.Dropout(dropout))
@@ -91,7 +91,12 @@ class UNetGenerator(nn.Module):
         self.downs = nn.ModuleList()
         prev_ch = in_ch
         for i, out_ch in enumerate(enc_channels):
-            self.downs.append(DownBlock(prev_ch, out_ch, normalize=(i != 0)))
+            # no norm on the outermost layer (i==0, standard pix2pix convention) or the
+            # innermost/bottleneck layer (i==n_blocks-1): InstanceNorm on a 1x1 feature
+            # map is degenerate -- mean equals the single value, so it normalizes every
+            # activation to exactly zero regardless of input, destroying the bottleneck.
+            normalize = i != 0 and i != self.n_blocks - 1
+            self.downs.append(DownBlock(prev_ch, out_ch, normalize=normalize))
             prev_ch = out_ch
 
         # decoder: n_blocks - 1 up-blocks with skip connections, then a final
@@ -167,15 +172,15 @@ class PatchDiscriminator(nn.Module):
             nn.LeakyReLU(0.2, inplace=False),
 
             sn(nn.Conv2d(base_channels, base_channels * 2, kernel_size=4, stride=2, padding=1)),
-            nn.BatchNorm2d(base_channels * 2),
+            nn.InstanceNorm2d(base_channels * 2, affine=True),
             nn.LeakyReLU(0.2, inplace=False),
 
             sn(nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=4, stride=2, padding=1)),
-            nn.BatchNorm2d(base_channels * 4),
+            nn.InstanceNorm2d(base_channels * 4, affine=True),
             nn.LeakyReLU(0.2, inplace=False),
 
             sn(nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=4, stride=1, padding=1)),
-            nn.BatchNorm2d(base_channels * 8),
+            nn.InstanceNorm2d(base_channels * 8, affine=True),
             nn.LeakyReLU(0.2, inplace=False),
         )
         self.minibatch_stddev = MinibatchStdDev()

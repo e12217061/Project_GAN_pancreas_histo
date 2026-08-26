@@ -24,8 +24,6 @@ from PIL import Image
 from dataset import SpatialMaskDataset
 from models import UNetGenerator, PatchDiscriminator
 import sys
-from gitlogger import GitHubLogger
-from dotenv import load_dotenv
 
 try:
     from torchmetrics.image.fid import FrechetInceptionDistance
@@ -87,6 +85,11 @@ def parse_args():
     p.add_argument("--r1_every", type=int, default=16,
                     help="Apply R1 only every N discriminator steps (lazy, scaled to "
                          "compensate). Set to 1 for every step.")
+    p.add_argument("--r1_warmup_epochs", type=int, default=5,
+                    help="Skip R1 entirely for this many epochs at the start of "
+                         "training, so the adversarial game has a chance to find a "
+                         "reasonable footing before the extra regularization pressure "
+                         "kicks in. Set to 0 to disable the warmup.")
     p.add_argument("--ema_decay", type=float, default=0.995,
                     help="EMA decay for G's weights. Sample grids, FID, and the "
                          "best-FID checkpoint all use the EMA generator.")
@@ -127,9 +130,14 @@ def auto_device(requested=None):
 # --- R1 PENALTY ---
 def r1_penalty(real_imgs, d_real):
     """Gradient penalty on D's output w.r.t. real images (Mescheder et al. 2018).
-    Requires real_imgs.requires_grad_(True) before D(mask, real_imgs) was called."""
+    Requires real_imgs.requires_grad_(True) before D(mask, real_imgs) was called.
+    Uses d_real.mean() (not .sum()) so the penalty's magnitude doesn't scale with how
+    many output elements D produces -- important here because PatchDiscriminator
+    outputs a whole grid of predictions (~62x62 per image) rather than one scalar, and
+    summing over all of them would inflate the effective penalty by roughly that
+    factor for the exact same --r1_gamma value."""
     grad_real = torch.autograd.grad(
-        outputs=d_real.sum(), inputs=real_imgs, create_graph=True
+        outputs=d_real.mean(), inputs=real_imgs, create_graph=True
     )[0]
     return grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
 
@@ -221,13 +229,6 @@ def main():
     device = auto_device(args.device)
     print(f"[train] Using device: {device}")
 
-
-    load_dotenv()
-    gh_token =  os.environ.get("GITHUB_TOKEN")
-
-    gitlogger = GitHubLogger(token=gh_token, repo_name="e12217061/Project_GAN_pancreas_histo", issue_number=2)
-
-
     if args.eval_fid_every > 0:
         if FrechetInceptionDistance is None:
             raise ImportError("Please install torchmetrics to evaluate FID: pip install \"torchmetrics[image]\"")
@@ -268,9 +269,13 @@ def main():
                          num_workers=args.num_workers, drop_last=True,
                          pin_memory=(device.type == "cuda"))
 
-    # fixed pairs for the sample grid -- same ones every epoch
+    # fixed pairs for the sample grid -- same ones every epoch. Spread the indices
+    # across the whole dataset rather than taking the first N: find_pairs() sorts by
+    # class subdirectory, so the first N items are likely all the same class -- which
+    # is exactly why every row showed the same mask color last run.
     n_sample = min(args.num_sample_pairs, len(dataset))
-    sample_reals, sample_masks = zip(*[dataset[i] for i in range(n_sample)])
+    sample_indices = np.linspace(0, len(dataset) - 1, n_sample).astype(int).tolist()
+    sample_reals, sample_masks = zip(*[dataset[i] for i in sample_indices])
     sample_reals = torch.stack(sample_reals)
     sample_masks = torch.stack(sample_masks)
 
@@ -358,7 +363,8 @@ def main():
             with torch.no_grad():
                 fake_imgs = G(masks)
 
-            apply_r1 = args.r1_gamma > 0 and (global_step % args.r1_every == 0)
+            apply_r1 = (args.r1_gamma > 0 and epoch >= args.r1_warmup_epochs
+                        and (global_step % args.r1_every == 0))
             if apply_r1:
                 real_imgs.requires_grad_(True)
 
@@ -428,16 +434,9 @@ def main():
                               f"{current_lr:.8f}", f"{dt:.3f}"])
 
         if (epoch + 1) % args.sample_every == 0:
-            sample_path = out_dir / "samples" / f"pix2pix_epoch_{epoch+1:04d}.png"
+            sample_path = out_dir / "samples" / f"epoch_{epoch+1:04d}.png"
             save_sample_grid(G_ema, sample_masks, sample_reals, device, sample_path)
             logger.info(f"  saved sample grid (mask | generated | real) -> {sample_path}")
-
-    #GitLogger
-        gitlogger.log_epoch(epoch=epoch+1, d_loss=mean_d, g_adv=mean_g_adv, g_l1=mean_g_l1, r1=mean_r1, lr=current_lr, fid_score=fid_score)
-
-        local_file_path = f"gan_outputs/samples/pix2pix_epoch_{epoch+1:04d}.png"
-        repo_destination_path = f"gan_outputs/samples/pix2pix_epoch_{epoch+1:04d}.png"
-        gitlogger.commit_file(local_file_path, repo_destination_path, commit_message="Upload")
 
         def make_ckpt_dict():
             return {
