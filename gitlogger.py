@@ -9,18 +9,21 @@ class GitHubLogger:
         self.repo = self.g.get_repo(repo_name)
         self.issue = self.repo.get_issue(number=issue_number)
         
-    def log_epoch(self, epoch, d_loss, g_adv, g_l1, r1, lr, fid_score=None):
-        """Creates a new comment on the issue with the epoch's results."""
+    def log_epoch(self, epoch, d_loss, g_loss, r1, fid_score=None, embed_sim=None, lr=None):
         message = f"### 📊 Epoch {epoch}\n"
         message += f"* **Discriminator Loss**: `{d_loss:.4f}`\n"
-        message += f"* **Generator Adv Loss**: `{g_adv:.4f}`\n"
-        message += f"* **Generator L1 Loss**: `{g_l1:.4f}`\n"
+        message += f"* **Generator Loss**: `{g_loss:.4f}`\n"
         message += f"* **R1 Penalty**: `{r1:.4f}`\n"
-        message += f"* **Learning Rate**: `{lr:.6f}`\n"
-        
+
+        if embed_sim is not None:
+            message += f"* **Embedding Similarity**: `{embed_sim:.6f}`\n"
+
+        if lr is not None:
+            message += f"* **Learning Rate**: `{lr:.6f}`\n"
+
         if fid_score is not None:
             message += f"* **FID Score**: `{fid_score:.4f}`\n"
-            
+
         # Post the comment via API
         self.issue.create_comment(message)
         print(f"[GitHub] Successfully logged Epoch {epoch} to Issue #{self.issue.number}")

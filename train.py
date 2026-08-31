@@ -486,7 +486,7 @@ def main():
             logger.info(f"  saved sample grid (EMA) -> {sample_path}")
 
         # GITHUB LOGGING
-        gitlogger.log_epoch(epoch=epoch, d_loss=mean_d, g_loss=mean_g, fid_score=fid_score)
+        gitlogger.log_epoch(epoch=epoch+1, d_loss=mean_d, g_loss=mean_g, r1=mean_r1, fid_score=fid_score, embed_sim=embed_sim)
 
         local_file_path = f"gan_outputs/samples/epoch_{epoch+1:04d}.png"
         repo_destination_path = f"gan_outputs/samples/epoch_{epoch+1:04d}.png"
