@@ -1,29 +1,28 @@
 """
-dataset.py — paired (mask, image) loader for spatial mask-conditioned image synthesis
-(pix2pix-style). Unlike the class-conditional version, this returns the FULL mask as a
-one-hot spatial tensor (num_classes, H, W) instead of collapsing it to one label per
-image -- the generator learns "put class C here" from the mask's actual layout.
+dataset.py — loads a 512x512 (or whatever size your data already is) image from a
+folder and reads its class label directly off the name of the subfolder it lives in.
+No cropping, no resizing: your images are already the right size, and (for now) the
+label comes purely from which class folder the image is filed under -- masks are not
+read or used at all here.
 
-EXPECTED FOLDER LAYOUT (same as your class-conditional dataset.py, unchanged):
+EXPECTED FOLDER LAYOUT:
 
     <data_dir>/
         images/
-            adjacent_benign/
+            healthy/
                 slide_001.png
-            stroma/
+            tumor/
                 slide_002.png
-            ...
-        masks/
-            adjacent_benign/
-                slide_001.png      <- same filename as its image
-            stroma/
-                slide_002.png
-            ...
 
-Mask pixel values are expected to be 0 (background/unlabeled) and 1..num_classes for
-the actual classes -- the same convention your class-conditional dataset.py used
-(`label = pixel_value - 1`). If your masks use a different convention, adjust
-mask_to_onehot() below; it's the only place that needs to change.
+Every image under images/<class_name>/ gets label = index of <class_name> in the
+sorted list of class folder names found on disk (so with just "healthy" and "tumor",
+alphabetical order gives healthy -> 0, tumor -> 1). Pass class_names explicitly if you
+want to pin down the order yourself instead of relying on alphabetical sort, or to
+restrict/validate against a known set of classes.
+
+Random selection itself is handled by PyTorch: train.py creates the DataLoader with
+shuffle=True, which already draws a random image each step -- no custom randomness
+needed in here.
 """
 from pathlib import Path
 
@@ -35,94 +34,67 @@ from torch.utils.data import Dataset
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
 
-def find_pairs(data_dir, images_subdir="images", masks_subdir="masks"):
-    """Return a list of (image_path, mask_path) pairs matched by filename stem within
-    class subdirectories. Unchanged from the class-conditional dataset.py -- the file
-    layout doesn't need to change for the switch to spatial conditioning, only how the
-    mask is turned into a tensor once loaded (see mask_to_onehot / __getitem__ below)."""
+def find_images(data_dir, images_subdir="images"):
+    """Return a list of (image_path, class_name) pairs, one per image, with the class
+    name taken directly from the image's parent subdirectory, e.g.
+    images/healthy/slide_001.png -> class_name "healthy"."""
     data_dir = Path(data_dir)
     img_dir = data_dir / images_subdir
-    mask_dir = data_dir / masks_subdir
 
     if not img_dir.is_dir():
         raise FileNotFoundError(f"Expected an images folder at: {img_dir}")
-    if not mask_dir.is_dir():
-        raise FileNotFoundError(f"Expected a masks folder at: {mask_dir}")
 
-    pairs, missing = [], []
+    items = []
     for class_dir in sorted(img_dir.iterdir()):
         if not class_dir.is_dir():
             continue
         class_name = class_dir.name
-        mask_class_dir = mask_dir / class_name
-        if not mask_class_dir.is_dir():
-            print(f"[dataset] Warning: Mask subdirectory '{mask_class_dir}' not found. "
-                  f"Skipping class '{class_name}'.")
-            continue
-
-        mask_lookup = {p.stem: p for p in mask_class_dir.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS}
         for p in sorted(class_dir.iterdir()):
             if p.suffix.lower() not in IMAGE_EXTENSIONS:
                 continue
-            mask_path = mask_lookup.get(p.stem)
-            if mask_path is None:
-                missing.append(f"{class_name}/{p.name}")
-                continue
-            pairs.append((p, mask_path))
+            items.append((p, class_name))
 
-    if missing:
-        print(f"[dataset] Warning: {len(missing)} image(s) had no matching mask and were "
-              f"skipped, e.g. {missing[:5]}")
-    if not pairs:
-        raise RuntimeError(f"No (image, mask) pairs found under {data_dir}. "
-                            f"Check --images_subdir/--masks_subdir, folder structure, and filenames.")
-    return pairs
+    if not items:
+        raise RuntimeError(f"No images found under {img_dir}. Check --images_subdir "
+                           f"and folder structure (expects one subfolder per class).")
+    return items
 
 
-def mask_to_onehot(mask_arr, num_classes, background_label=0):
-    """Convert an integer-valued (H, W) mask into a (num_classes, H, W) float32
-    one-hot tensor. Pixels equal to background_label get an all-zero column across
-    every channel (i.e. "no class" -- the generator sees nothing there to condition
-    on); every other pixel value v is expected in [1, num_classes] and lands in
-    channel (v - 1)."""
-    h, w = mask_arr.shape[:2]
-    onehot = np.zeros((num_classes, h, w), dtype=np.float32)
-    for c in range(num_classes):
-        onehot[c] = (mask_arr == (c + 1)).astype(np.float32)
-    return onehot
+class PatchDataset(Dataset):
+    """One item = one (already-cropped) image + a class label taken from its folder."""
 
+    def __init__(self, data_dir, images_subdir="images", class_names=None):
+        self.items = find_images(data_dir, images_subdir)
 
-class SpatialMaskDataset(Dataset):
-    """One item = one (image, one-hot mask) pair, both at their native resolution --
-    your images are already cropped/selected, so there's no resizing here."""
+        # Build a stable class_name -> integer label mapping. By default this is just
+        # the sorted list of class folder names found on disk; pass class_names to
+        # pin down the order yourself (and to catch unexpected folders early).
+        discovered = sorted({class_name for _, class_name in self.items})
+        if class_names is not None:
+            missing = set(discovered) - set(class_names)
+            if missing:
+                raise ValueError(f"Found class folder(s) {sorted(missing)} that aren't "
+                                 f"in the given class_names {list(class_names)}.")
+            self.class_names = list(class_names)
+        else:
+            self.class_names = discovered
 
-    def __init__(self, data_dir, num_classes=4, images_subdir="images", masks_subdir="masks",
-                 background_label=0):
-        self.pairs = find_pairs(data_dir, images_subdir, masks_subdir)
-        self.num_classes = num_classes
-        self.background_label = background_label
-        print(f"[dataset] Found {len(self.pairs)} image/mask pairs across subdirectories.")
+        self.class_to_idx = {name: i for i, name in enumerate(self.class_names)}
+        self.num_classes = len(self.class_names)
+
+        print(f"[dataset] Found {len(self.items)} images across {self.num_classes} "
+              f"class folder(s): {self.class_to_idx}")
 
     def __len__(self):
-        return len(self.pairs)
+        return len(self.items)
 
     def __getitem__(self, idx):
-        img_path, mask_path = self.pairs[idx]
+        img_path, class_name = self.items[idx]
         image = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path)
-        if mask.mode not in ("L", "I", "P"):
-            mask = mask.convert("L")
-
         image_arr = np.array(image)
-        mask_arr = np.array(mask)
-        if image_arr.shape[:2] != mask_arr.shape[:2]:
-            raise ValueError(f"Image/mask size mismatch for {img_path.name}: "
-                              f"{image_arr.shape[:2]} vs {mask_arr.shape[:2]}")
 
-        onehot = mask_to_onehot(mask_arr, self.num_classes, self.background_label)
-        mask_t = torch.from_numpy(onehot)  # (num_classes, H, W)
+        label = self.class_to_idx[class_name]
 
         image_t = torch.from_numpy(image_arr.astype(np.float32) / 127.5 - 1.0)
-        image_t = image_t.permute(2, 0, 1).contiguous()  # (3, H, W), scaled to [-1, 1]
-
-        return image_t, mask_t
+        image_t = image_t.permute(2, 0, 1).contiguous()  # CHW, scaled to [-1, 1]
+        return image_t, label
