@@ -5,4 +5,4 @@
 dataset/
 prev_runs/
 .env
-gan_output
+gan_output/

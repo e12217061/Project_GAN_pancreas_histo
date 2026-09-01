@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from PIL import Image
 
 from dataset import PatchDataset
@@ -48,6 +48,22 @@ def parse_args():
                     help="Folder containing an images/ subfolder with one subdirectory "
                          "per class, e.g. images/healthy/, images/tumor/ (see README.md)")
     p.add_argument("--images_subdir", type=str, default="images")
+    p.add_argument("--no_augment", action="store_true",
+                    help="Disable rotation/flip augmentation (a random 90-degree "
+                         "rotation + optional H/V flip is applied by default).")
+    p.add_argument("--no_weighted_sampler", action="store_true",
+                    help="Disable class-balanced sampling (on by default -- each "
+                         "class is sampled roughly equally regardless of how many "
+                         "images it has). Plain random shuffling is used instead.")
+    p.add_argument("--stain_normalize", action="store_true",
+                    help="Enable stain-color normalization (off by default).")
+    p.add_argument("--stain_method", type=str, default="macenko",
+                    choices=["macenko", "vahadane"],
+                    help="'macenko' needs no extra dependencies. 'vahadane' needs "
+                         "`pip install staintools spams`.")
+    p.add_argument("--stain_target_image", type=str, default=None,
+                    help="Reference image to normalize stain colors to. If unset, "
+                         "the first image found in the dataset is used instead.")
     # model / image size
     p.add_argument("--patch_size", type=int, default=None,
                     help="Output resolution. Defaults to auto-detect from the first "
@@ -92,7 +108,7 @@ def parse_args():
     p.add_argument("--lr_min_factor", type=float, default=0.1,
                     help="LR at the final epoch, as a fraction of the initial --lr.")
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--max_batches_per_epoch", type=int, default=5,
+    p.add_argument("--max_batches_per_epoch", type=int, default=0,
                     help="For quick dev runs: process at most this many batches per epoch (0 = no limit)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default=None,
@@ -278,7 +294,13 @@ def main():
     except Exception:
         logger.debug("Could not write PID file.")
 
-    dataset = PatchDataset(args.data_dir, images_subdir=args.images_subdir)
+    dataset = PatchDataset(
+        args.data_dir, images_subdir=args.images_subdir,
+        augment=not args.no_augment,
+        stain_normalize=args.stain_normalize,
+        stain_method=args.stain_method,
+        stain_target_image=args.stain_target_image,
+    )
     args.num_classes = dataset.num_classes
 
     if args.patch_size is None:
@@ -287,8 +309,20 @@ def main():
         print(f"[train] --patch_size not set, auto-detected {args.patch_size} "
               f"from the first image in your dataset.")
 
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                         num_workers=args.num_workers, drop_last=True,
+    if args.no_weighted_sampler:
+        sampler, shuffle = None, True
+    else:
+        class_counts = np.bincount(dataset.labels, minlength=dataset.num_classes)
+        class_weights = 1.0 / np.clip(class_counts, 1, None)
+        sample_weights = class_weights[dataset.labels]
+        sampler = WeightedRandomSampler(weights=torch.as_tensor(sample_weights, dtype=torch.double),
+                                         num_samples=len(dataset), replacement=True)
+        shuffle = False
+        logger.info(f"[train] Using a class-balanced WeightedRandomSampler "
+                    f"(counts: {dict(zip(dataset.class_names, class_counts.tolist()))})")
+
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=shuffle,
+                         sampler=sampler, num_workers=args.num_workers, drop_last=True,
                          pin_memory=(device.type == "cuda"))
 
     G = Generator(latent_dim=args.latent_dim, num_classes=args.num_classes,
