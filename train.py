@@ -55,7 +55,7 @@ def parse_args():
                     help="Disable class-balanced sampling (on by default -- each "
                          "class is sampled roughly equally regardless of how many "
                          "images it has). Plain random shuffling is used instead.")
-    p.add_argument("--stain_normalize", action="store_true",
+    p.add_argument("--stain_normalize", action="store_false",
                     help="Enable stain-color normalization (off by default).")
     p.add_argument("--stain_method", type=str, default="macenko",
                     choices=["macenko", "vahadane"],
