@@ -113,6 +113,19 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default=None,
                     help="'cuda', 'mps', or 'cpu'. Auto-detected if not set.")
+    
+    # --- ADDED FOR MEMORY MANAGEMENT (Gradient Accumulation & AMP) ---
+    p.add_argument("--accum_steps", type=int, default=1,
+                    help="Number of micro-batches to accumulate gradients over before updating weights. "
+                         "Set this > 1 to simulate a larger effective batch size while fitting inside VRAM.")
+    p.add_argument("--use_amp", action="store_true",
+                    help="Enable Automatic Mixed Precision (AMP). Casts operations to FP16, roughly "
+                         "halving VRAM usage and accelerating training on modern GPUs.")
+    p.add_argument("--expandable_segments", action="store_true",
+                    help="Sets PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True internally before training "
+                         "to reduce CUDA memory fragmentation.")
+    # -----------------------------------------------------------------
+
     # output
     p.add_argument("--output_dir", type=str, default="./gan_outputs")
     p.add_argument("--sample_every", type=int, default=1, help="Save a sample grid every N epochs.")
@@ -130,7 +143,7 @@ def parse_args():
     # --- ADDED FOR PERCEPTUAL LOSS ---
     p.add_argument("--enable_perceptual_loss", action="store_true",
                    help="Enable DenseNet201-based perceptual loss for sharper cellular textures.")
-    p.add_argument("--lambda_perceptual", type=float, default=1.0,
+    p.add_argument("--lambda_perceptual", type=float, default=0.005,
                    help="Weight multiplier for the perceptual loss (only used if --enable_perceptual_loss is set).")
     # ---------------------------------
     
@@ -263,6 +276,12 @@ def evaluate_fid(generator, dataloader, fid_metric, latent_dim, device, max_samp
 
 def main():
     args = parse_args()
+    
+    # Address CUDA memory fragmentation if requested
+    if args.expandable_segments:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        print("[train] Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+        
     torch.manual_seed(args.seed)
     device = auto_device(args.device)
     print(f"[train] Using device: {device}")
@@ -351,6 +370,10 @@ def main():
     opt_d = torch.optim.Adam(D.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
     criterion = nn.BCEWithLogitsLoss()
 
+    # --- Initialize AMP Scalers if requested ---
+    scaler_g = torch.amp.GradScaler('cuda') if args.use_amp and device.type == "cuda" else None
+    scaler_d = torch.amp.GradScaler('cuda') if args.use_amp and device.type == "cuda" else None
+
     # --- ADDED FOR LR DECAY ---
     lr_lambda = make_lr_lambda(args.epochs, args.lr_decay_start_frac, args.lr_min_factor)
     sched_g = torch.optim.lr_scheduler.LambdaLR(opt_g, lr_lambda)
@@ -373,6 +396,13 @@ def main():
         D.load_state_dict(ckpt["D"])
         opt_g.load_state_dict(ckpt["opt_g"])
         opt_d.load_state_dict(ckpt["opt_d"])
+        
+        # Load scaler states if AMP was used previously
+        if scaler_g and "scaler_g" in ckpt:
+            scaler_g.load_state_dict(ckpt["scaler_g"])
+        if scaler_d and "scaler_d" in ckpt:
+            scaler_d.load_state_dict(ckpt["scaler_d"])
+            
         start_epoch = ckpt["epoch"] + 1
         # backward-compatible: older checkpoints (before this update) won't have these
         if "G_ema" in ckpt:
@@ -387,8 +417,10 @@ def main():
         print(f"[train] Resumed from {args.resume} at epoch {start_epoch} "
               f"(best_fid so far: {best_fid:.4f})")
 
-    logger.info(f"[train] {len(dataset)} patches/epoch, batch_size={args.batch_size}, "
-                f"patch_size={args.patch_size}, num_classes={args.num_classes}")
+    eff_batch_size = args.batch_size * args.accum_steps
+    logger.info(f"[train] {len(dataset)} patches/epoch, micro_batch_size={args.batch_size}, "
+                f"accum_steps={args.accum_steps} (Effective batch: {eff_batch_size}), "
+                f"patch_size={args.patch_size}, num_classes={args.num_classes}, AMP={'ON' if args.use_amp else 'OFF'}")
 
     # Setup CSV header if needed
     if not csv_path.exists():
@@ -417,6 +449,10 @@ def main():
 
         logger.info(f"Starting epoch {epoch+1}/{args.epochs}")
 
+        # Zero gradients at the start of epoch for accumulation
+        opt_d.zero_grad(set_to_none=True)
+        opt_g.zero_grad(set_to_none=True)
+
         # per-batch progress bar (if tqdm available)
         batch_iter = loader
         if tqdm is not None:
@@ -426,7 +462,7 @@ def main():
                 total_batches = None
             batch_iter = tqdm(loader, desc=f"epoch {epoch+1}", total=total_batches, leave=False)
 
-        for real_imgs, labels in batch_iter:
+        for i, (real_imgs, labels) in enumerate(batch_iter):
             real_imgs = real_imgs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             bs = real_imgs.size(0)
@@ -434,61 +470,105 @@ def main():
             real_target = torch.full((bs, 1), args.label_smoothing, device=device)
             fake_target = torch.zeros((bs, 1), device=device)
 
-            # --- Discriminator step ---
-            opt_d.zero_grad(set_to_none=True)
-            z = torch.randn(bs, args.latent_dim, device=device)
-            with torch.no_grad():
-                fake_imgs = G(z, labels)
-
             # --- ADDED FOR R1 PENALTY ---
             apply_r1 = args.r1_gamma > 0 and (global_step % args.r1_every == 0)
             if apply_r1:
                 real_imgs.requires_grad_(True)
             # ---------------------
 
-            d_real = D(real_imgs, labels)
-            d_fake = D(fake_imgs, labels)
-            d_loss = criterion(d_real, real_target) + criterion(d_fake, fake_target)
+            # =========================================================
+            #  Discriminator Step (with optional AMP and Accumulation)
+            # =========================================================
+            with torch.amp.autocast('cuda', enabled=args.use_amp):
+                z = torch.randn(bs, args.latent_dim, device=device)
+                with torch.no_grad():
+                    fake_imgs = G(z, labels)
 
-            # --- ADDED FOR R1 PENALTY ---
-            if apply_r1:
-                r1 = r1_penalty(real_imgs, d_real)
-                # scaled by r1_every to compensate for only applying it periodically
-                d_loss = d_loss + (args.r1_gamma / 2) * r1 * args.r1_every
-                running_r1 += r1.item()
-                n_r1 += 1
-            # ---------------------
+                d_real = D(real_imgs, labels)
+                d_fake = D(fake_imgs, labels)
+                
+                # Base Adversarial Loss
+                d_loss_raw = criterion(d_real, real_target) + criterion(d_fake, fake_target)
+                
+                # R1 Penalty
+                if apply_r1:
+                    r1 = r1_penalty(real_imgs, d_real)
+                    # scaled by r1_every to compensate for only applying it periodically
+                    d_loss_raw = d_loss_raw + (args.r1_gamma / 2) * r1 * args.r1_every
+                    running_r1 += r1.item()
+                    n_r1 += 1
+                
+                # Scale loss by accumulation steps
+                d_loss_scaled = d_loss_raw / args.accum_steps
 
-            d_loss.backward()
-            opt_d.step()
-            global_step += 1
-
-            # --- Generator step ---
-            opt_g.zero_grad(set_to_none=True)
-            
-            z = torch.randn(bs, args.latent_dim, device=device)
-            fake_imgs = G(z, labels)
-            
-            # 1. Adversarial Loss
-            d_fake_for_g = D(fake_imgs, labels)
-            g_adv_loss = criterion(d_fake_for_g, torch.full((bs, 1), 1.0, device=device))
-            
-            # 2. Perceptual Loss (Using detached real_imgs to avoid R1 memory leaks)
-            if args.enable_perceptual_loss and perceptual_criterion is not None:
-                g_perc_loss = perceptual_criterion(fake_imgs, real_imgs.detach())
-                g_loss = g_adv_loss + (args.lambda_perceptual * g_perc_loss)
+            # Backward pass for D
+            if args.use_amp:
+                scaler_d.scale(d_loss_scaled).backward()
             else:
-                g_loss = g_adv_loss
-            
-            g_loss.backward()
-            opt_g.step()
+                d_loss_scaled.backward()
 
-            # --- ADDED FOR EMA ---
-            update_ema(G_ema, G, args.ema_decay)
-            # ---------------------
+            # Optimizer Step for D (with Gradient Clipping)
+            if (i + 1) % args.accum_steps == 0 or (i + 1) == len(loader):
+                if args.use_amp:
+                    # Unscale before clipping to get actual gradient values
+                    scaler_d.unscale_(opt_d)
+                    torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=10.0)
+                    scaler_d.step(opt_d)
+                    scaler_d.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=10.0)
+                    opt_d.step()
+                opt_d.zero_grad(set_to_none=True)
+                global_step += 1
 
-            running_d += d_loss.item()
-            running_g += g_loss.item() # This now logs the combined Total Generator Loss
+            # =========================================================
+            #  Generator Step (with optional AMP and Accumulation)
+            # =========================================================
+            with torch.amp.autocast('cuda', enabled=args.use_amp):
+                z = torch.randn(bs, args.latent_dim, device=device)
+                fake_imgs = G(z, labels)
+                
+                # 1. Adversarial Loss
+                d_fake_for_g = D(fake_imgs, labels)
+                g_adv_loss = criterion(d_fake_for_g, torch.full((bs, 1), 1.0, device=device))
+                
+                # 2. Perceptual Loss (Using detached real_imgs to avoid R1 memory leaks)
+                if args.enable_perceptual_loss and perceptual_criterion is not None:
+                    g_perc_loss = perceptual_criterion(fake_imgs, real_imgs.detach())
+                    g_loss_raw = g_adv_loss + (args.lambda_perceptual * g_perc_loss)
+                else:
+                    g_loss_raw = g_adv_loss
+                
+                # Scale loss by accumulation steps
+                g_loss_scaled = g_loss_raw / args.accum_steps
+
+            # Backward pass for G
+            if args.use_amp:
+                scaler_g.scale(g_loss_scaled).backward()
+            else:
+                g_loss_scaled.backward()
+
+            # Optimizer Step for G (with Gradient Clipping)
+            if (i + 1) % args.accum_steps == 0 or (i + 1) == len(loader):
+                if args.use_amp:
+                    # Unscale before clipping to get actual gradient values
+                    scaler_g.unscale_(opt_g)
+                    torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=10.0)
+                    scaler_g.step(opt_g)
+                    scaler_g.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=10.0)
+                    opt_g.step()
+                opt_g.zero_grad(set_to_none=True)
+
+                # --- ADDED FOR EMA ---
+                # Update EMA only when actual optimizer step is taken
+                update_ema(G_ema, G, args.ema_decay)
+                # ---------------------
+
+            # Track unscaled metrics for accurate logging
+            running_d += d_loss_raw.item()
+            running_g += g_loss_raw.item()
             n_batches += 1
             
             # optional early-exit for dev runs
@@ -559,6 +639,8 @@ def main():
                 "G_ema": G_ema.state_dict(),
                 "opt_g": opt_g.state_dict(), "opt_d": opt_d.state_dict(),
                 "sched_g": sched_g.state_dict(), "sched_d": sched_d.state_dict(),
+                "scaler_g": scaler_g.state_dict() if scaler_g else None,
+                "scaler_d": scaler_d.state_dict() if scaler_d else None,
                 "best_fid": best_fid, "args": vars(args),
             }
 
@@ -576,6 +658,14 @@ def main():
             ckpt_path = out_dir / "checkpoints" / f"ckpt_epoch_{epoch+1:04d}.pt"
             torch.save(make_ckpt_dict(), ckpt_path)
             print(f"  saved checkpoint -> {ckpt_path}")
+            
+            # --- ADDED: ROLLING CHECKPOINTS TO PREVENT DISK CRASHES ---
+            all_ckpts = sorted((out_dir / "checkpoints").glob("ckpt_epoch_*.pt"))
+            if len(all_ckpts) > 3:
+                for old_ckpt in all_ckpts[:-3]:
+                    old_ckpt.unlink()
+                    logger.info(f"  deleted old checkpoint -> {old_ckpt.name} to save space")
+            # ----------------------------------------------------------
 
     print("[train] Done.")
 

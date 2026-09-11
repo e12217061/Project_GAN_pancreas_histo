@@ -59,7 +59,7 @@ def find_images(data_dir, images_subdir="images"):
     name taken directly from the image's parent subdirectory, e.g.
     images/healthy/slide_001.png -> class_name "healthy"."""
     data_dir = Path(data_dir)
-    img_dir = data_dir #/ images_subdir
+    img_dir = data_dir / images_subdir
 
     if not img_dir.is_dir():
         raise FileNotFoundError(f"Expected an images folder at: {img_dir}")
