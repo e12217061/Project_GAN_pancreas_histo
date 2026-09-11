@@ -46,6 +46,10 @@ import torch
 from torch.utils.data import Dataset
 
 from stain_norm import build_stain_normalizer
+from PIL import PngImagePlugin
+
+# Increase the maximum allowed text/iCCP chunk size to prevent crashing on WSI patches
+PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024  # Sets limit to 100MB
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
@@ -55,7 +59,7 @@ def find_images(data_dir, images_subdir="images"):
     name taken directly from the image's parent subdirectory, e.g.
     images/healthy/slide_001.png -> class_name "healthy"."""
     data_dir = Path(data_dir)
-    img_dir = data_dir / images_subdir
+    img_dir = data_dir #/ images_subdir
 
     if not img_dir.is_dir():
         raise FileNotFoundError(f"Expected an images folder at: {img_dir}")

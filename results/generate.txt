@@ -1,0 +1,52 @@
+TSTR TEST on DCGAN with dataaug on 1.September
+
+(generation of 25k/25k)
+
+=============================================
+FINAL EVALUATION METRICS
+=============================================
+FID Score:          28.0952
+KID Score:          0.014001 ± 0.005251
+Inception Score:    2.4468 ± 0.0195
+=============================================
+
+
+
+DCGAN trained on 2 class w/ data-aug & stain-norm (Sim Sep2-3) 
+(generation of 20k, 73k)
+
+=============================================
+FINAL EVALUATION METRICS
+=============================================
+FID Score:          18.6257
+KID Score:          0.007407 ± 0.004557
+Inception Score:    2.5036 ± 0.0213
+=============================================
+
+(generation of 25k/25k)
+
+Computing final metrics (this may take a few minutes)...
+=============================================
+FINAL EVALUATION METRICS
+=============================================
+FID Score:          19.9904
+KID Score:          0.007215 ± 0.004969
+Inception Score:    2.6194 ± 0.0225
+
+
+
+
+DCGAN trained on 2 class w/ data-aug & stain-norm (abmil_dataset16k6k) 
+(generation of 16k, 6k)
+
+=============================================
+FINAL EVALUATION METRICS
+=============================================
+FID Score:          35.8864
+KID Score:          0.011923 ± 0.005408
+Inception Score:    3.4861 ± 0.0522
+=============================================
+
+
+DCGAN trained on 2 class w/ data-aug & stain-norm (abmil_train_mixed) with abmil 60% top - 40% center attention score selection
+(generation of 12k, 52k)

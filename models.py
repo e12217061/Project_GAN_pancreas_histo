@@ -24,6 +24,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as models
 
 
 def num_upsample_blocks(target_size: int, base_size: int = 4) -> int:
@@ -96,6 +97,41 @@ class MinibatchStdDev(nn.Module):
         std = torch.sqrt(x.var(dim=0, unbiased=False) + self.eps)  # (C, H, W)
         mean_std = std.mean().view(1, 1, 1, 1).expand(x.size(0), 1, x.size(2), x.size(3))
         return torch.cat([x, mean_std], dim=1)
+
+class DenseNetPerceptualLoss(nn.Module):
+    def __init__(self):
+        super(DenseNetPerceptualLoss, self).__init__()
+        # Load pre-trained DenseNet201 features
+        densenet = models.densenet201(weights=models.DenseNet201_Weights.IMAGENET1K_V1).features
+        
+        # DenseNet features structure: 
+        # 0:conv0, 1:norm0, 2:relu0, 3:pool0, 4:denseblock1, 5:transition1, 6:denseblock2...
+        # We slice up to index 6 to capture early-to-mid level textures (perfect for histology)
+        self.slice = nn.Sequential(*list(densenet.children())[:6])
+        
+        # CRITICAL: Freeze the weights to prevent massive VRAM consumption
+        for param in self.parameters():
+            param.requires_grad = False
+            
+        self.criterion = nn.L1Loss() # L1 loss produces sharper images than MSE
+
+    def forward(self, input_images, target_images):
+        # VGG and DenseNet expect ImageNet normalization. 
+        # Assuming your GAN outputs [-1, 1], we map it to [0, 1] then normalize.
+        input_images = (input_images + 1) / 2
+        target_images = (target_images + 1) / 2
+        
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(input_images.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(input_images.device)
+        
+        input_images = (input_images - mean) / std
+        target_images = (target_images - mean) / std
+        
+        # Extract features and calculate distance
+        input_features = self.slice(input_images)
+        target_features = self.slice(target_images)
+        
+        return self.criterion(input_features, target_features)
 
 
 class Discriminator(nn.Module):

@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from PIL import Image
 
 from dataset import PatchDataset
-from models import Generator, Discriminator
+from models import DenseNetPerceptualLoss, Generator, Discriminator
 from gitlogger import GitHubLogger
 from dotenv import load_dotenv
 import sys
@@ -126,6 +126,14 @@ def parse_args():
     p.add_argument("--fid_samples", type=int, default=2048, 
                     help="Max number of samples to use for computing FID (standard is 50k, but 2k-5k is faster for intermediate checks).")
     # ---------------------
+    
+    # --- ADDED FOR PERCEPTUAL LOSS ---
+    p.add_argument("--enable_perceptual_loss", action="store_true",
+                   help="Enable DenseNet201-based perceptual loss for sharper cellular textures.")
+    p.add_argument("--lambda_perceptual", type=float, default=1.0,
+                   help="Weight multiplier for the perceptual loss (only used if --enable_perceptual_loss is set).")
+    # ---------------------------------
+    
     return p.parse_args()
 
 
@@ -259,7 +267,6 @@ def main():
     device = auto_device(args.device)
     print(f"[train] Using device: {device}")
 
-
     load_dotenv()
     gh_token =  os.environ.get("GITHUB_TOKEN")
 
@@ -349,6 +356,14 @@ def main():
     sched_g = torch.optim.lr_scheduler.LambdaLR(opt_g, lr_lambda)
     sched_d = torch.optim.lr_scheduler.LambdaLR(opt_d, lr_lambda)
     # ---------------------
+    
+    # --- ADDED FOR PERCEPTUAL LOSS ---
+    if args.enable_perceptual_loss:
+        logger.info("Initializing DenseNetPerceptualLoss (this may download weights if first time)...")
+        perceptual_criterion = DenseNetPerceptualLoss().to(device).eval()
+    else:
+        perceptual_criterion = None
+    # ---------------------------------
 
     start_epoch = 0
     best_fid = float("inf")  # --- ADDED FOR BEST-FID CHECKPOINTING ---
@@ -450,10 +465,21 @@ def main():
 
             # --- Generator step ---
             opt_g.zero_grad(set_to_none=True)
+            
             z = torch.randn(bs, args.latent_dim, device=device)
             fake_imgs = G(z, labels)
+            
+            # 1. Adversarial Loss
             d_fake_for_g = D(fake_imgs, labels)
-            g_loss = criterion(d_fake_for_g, torch.full((bs, 1), 1.0, device=device))
+            g_adv_loss = criterion(d_fake_for_g, torch.full((bs, 1), 1.0, device=device))
+            
+            # 2. Perceptual Loss (Using detached real_imgs to avoid R1 memory leaks)
+            if args.enable_perceptual_loss and perceptual_criterion is not None:
+                g_perc_loss = perceptual_criterion(fake_imgs, real_imgs.detach())
+                g_loss = g_adv_loss + (args.lambda_perceptual * g_perc_loss)
+            else:
+                g_loss = g_adv_loss
+            
             g_loss.backward()
             opt_g.step()
 
@@ -462,8 +488,9 @@ def main():
             # ---------------------
 
             running_d += d_loss.item()
-            running_g += g_loss.item()
+            running_g += g_loss.item() # This now logs the combined Total Generator Loss
             n_batches += 1
+            
             # optional early-exit for dev runs
             if args.max_batches_per_epoch > 0 and n_batches >= args.max_batches_per_epoch:
                 break

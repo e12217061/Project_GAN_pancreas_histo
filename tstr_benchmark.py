@@ -2,17 +2,19 @@
 tstr_benchmark.py — Evaluates synthetic data utility via TSTR and TRTR.
 
 Usage:
-    python tstr_benchmark.py --real_train_dir ./dataset --synth_train_dir syn_dataset --real_test_dir data/real_holdout_test \
-                             --mode both
+    python tstr_benchmark.py --real_train_dir ./dataset --synth_train_dir ./synthetic-data --real_test_dir ./unseen_data --mode both
 """
 import argparse
 import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from torchgen import model
+from torchgen import model
 import torchvision.models as models
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, confusion_matrix
 import numpy as np
+from tqdm import tqdm
 
 # Re-use your existing dataset loader
 from dataset import PatchDataset
@@ -23,10 +25,11 @@ def parse_args():
     p.add_argument("--synth_train_dir", type=str, required=True, help="Path to synthetic training data")
     p.add_argument("--real_test_dir", type=str, required=True, help="Path to real holdout test data")
     p.add_argument("--mode", type=str, choices=['TRTR', 'TSTR', 'both'], default='both')
+    p.add_argument("--model", type=str, choices=['resnet50', 'densenet201'], default='densenet201', help="Backbone (resnet18 or resnet50)")
+
     
-    p.add_argument("--model", type=str, default="resnet18", help="Backbone (resnet18 or resnet50)")
-    p.add_argument("--epochs", type=int, default=15)
-    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--epochs", type=int, default=8)
+    p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -35,12 +38,14 @@ def build_classifier(model_name, num_classes, device):
     """Loads a pre-trained ResNet and replaces the final head for our tissue classes."""
     if model_name == "resnet50":
         model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        in_features = model.fc.in_features
+        model.fc = nn.Linear(in_features, num_classes)
     else:
-        model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        model = models.densenet201(weights=models.DenseNet201_Weights.DEFAULT)
+        in_features = model.classifier.in_features
+        model.classifier = nn.Linear(in_features, num_classes)
         
     # Replace the classification head
-    in_features = model.fc.in_features
-    model.fc = nn.Linear(in_features, num_classes)
     return model.to(device)
 
 def get_balanced_loader(dataset, batch_size):
@@ -66,7 +71,10 @@ def train_classifier(model, train_loader, epochs, lr, device, run_name):
         model.train()
         running_loss = 0.0
         
-        for imgs, labels in train_loader:
+        # Wrap train_loader with tqdm for a per-epoch progress bar
+        batch_iter = tqdm(train_loader, desc=f"[{run_name}] Epoch {epoch+1}/{epochs}", leave=False)
+        
+        for imgs, labels in batch_iter:
             imgs, labels = imgs.to(device), labels.to(device)
             
             optimizer.zero_grad()
@@ -76,6 +84,9 @@ def train_classifier(model, train_loader, epochs, lr, device, run_name):
             optimizer.step()
             
             running_loss += loss.item() * imgs.size(0)
+            
+            # Live-update the progress bar with the current batch loss
+            batch_iter.set_postfix({"loss": f"{loss.item():.4f}"})
             
         epoch_loss = running_loss / len(train_loader.dataset)
         print(f"[{run_name}] Epoch {epoch+1}/{epochs} | Loss: {epoch_loss:.4f}")
@@ -91,7 +102,8 @@ def evaluate_classifier(model, test_loader, device, run_name, class_names):
     all_targets = []
     
     with torch.no_grad():
-        for imgs, labels in test_loader:
+        # Added tqdm here as well for evaluation feedback
+        for imgs, labels in tqdm(test_loader, desc=f"Evaluating {run_name}"):
             imgs, labels = imgs.to(device), labels.to(device)
             outputs = model(imgs)
             _, preds = torch.max(outputs, 1)

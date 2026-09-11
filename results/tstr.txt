@@ -1,0 +1,61 @@
+TSTR TEST on DCGAN with dataaug on 1.September
+Data:   Training: {'healthy': 20000, 'tumor': 73000} real & {'healthy': 25000, 'tumor': 25000} syn
+        Test (unseen): {'healthy': 3617, 'tumor': 12855}
+
+Evaluating TRTR:
+Accuracy:          0.9984
+Balanced Accuracy: 0.9988
+Macro F1 Score:    0.9976
+Confusion Matrix:
+[[ 3615     2]
+ [   25 12830]]
+
+
+ Evaluating TSTR:
+Accuracy:          0.9123
+Balanced Accuracy: 0.9027
+Macro F1 Score:    0.8792
+Confusion Matrix:
+[[ 3203   414]
+ [ 1031 11824]]
+
+=======================================================
+                 FINAL UTILITY COMPARISON              
+=======================================================
+Metric             | TRTR Baseline | TSTR Pipeline | Gap
+-------------------------------------------------------
+Accuracy           | 0.9984        | 0.9123        | 0.0861
+Balanced Accuracy  | 0.9988        | 0.9027        | 0.0961
+F1                 | 0.9976        | 0.8792        | 0.1184
+=======================================================
+
+
+DCGAN trained on 2 class w/ data-aug & stain-norm (Sim Sep2-3) 
+
+
+Data:   Training: {'healthy': 20000, 'tumor': 73000} real & {'healthy': 20000, 'tumor': 73000} syn
+        Test (unseen): {'healthy': 3617, 'tumor': 12855}
+
+
+Accuracy:          0.8312
+Balanced Accuracy: 0.8847
+Macro F1 Score:    0.7989
+Confusion Matrix:
+[[ 3545    72]
+ [ 2708 10147]]
+
+=======================================================
+                 FINAL UTILITY COMPARISON              
+=======================================================
+Metric             | TRTR Baseline | TSTR Pipeline | Gap
+-------------------------------------------------------
+Accuracy           | 0.9995        | 0.8312        | 0.1682
+Balanced Accuracy  | 0.9991        | 0.8847        | 0.1143
+F1                 | 0.9992        | 0.7989        | 0.2003
+=======================================================
+
+
+
+
+
+
