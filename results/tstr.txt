@@ -83,3 +83,13 @@ Macro F1 Score:    0.8249
 Confusion Matrix:
 [[ 3438   179]
  [ 2143 10712]]
+
+
+ tstr run with data aug
+ 
+Accuracy:          0.8589
+Balanced Accuracy: 0.9022
+Macro F1 Score:    0.8271
+Confusion Matrix:
+[[ 3543    74]
+ [ 2251 10604]]

@@ -19,6 +19,14 @@ alphabetical order gives healthy -> 0, tumor -> 1). Pass class_names explicitly 
 want to pin down the order yourself instead of relying on alphabetical sort, or to
 restrict/validate against a known set of classes.
 
+ATTENTION-SCORE CONDITIONING: every item also carries a per-patch attention score,
+read from an AB-MIL attention manifest CSV (see attention_manifest.py) and matched to
+each image by filename. This is now a required input -- the GAN architecture
+(models.py) conditions on it alongside the class label, so every training image needs
+a score. See attention_manifest.py's docstring for the assumed CSV format and for an
+important caveat about raw attention weights not being comparable across slides with
+different patch counts.
+
 Optional per-item processing (all off by default except augment):
 - augment: random dihedral (D4) augmentation -- one of the four 90-degree rotations,
   each optionally mirrored horizontally/vertically. No interpolation is involved (exact
@@ -46,6 +54,7 @@ import torch
 from torch.utils.data import Dataset
 
 from stain_norm import build_stain_normalizer
+from load_attention_scores import load_attention_manifest
 from PIL import PngImagePlugin
 
 # Increase the maximum allowed text/iCCP chunk size to prevent crashing on WSI patches
@@ -85,7 +94,8 @@ class PatchDataset(Dataset):
 
     def __init__(self, data_dir, images_subdir="images", class_names=None,
                  augment=True, stain_normalize=False, stain_method="macenko",
-                 stain_target_image=None):
+                 stain_target_image=None, attention_manifest=None,
+                 attention_fallback=None):
         self.items = find_images(data_dir, images_subdir)
 
         # Build a stable class_name -> integer label mapping. By default this is just
@@ -111,6 +121,48 @@ class PatchDataset(Dataset):
         counts = {name: self.labels.count(idx) for name, idx in self.class_to_idx.items()}
         print(f"[dataset] Found {len(self.items)} images across {self.num_classes} "
               f"class folder(s): {self.class_to_idx} (counts: {counts})")
+
+        # Attention-score conditioning: look up each image's score by filename in the
+        # AB-MIL attention manifest. Required, since the GAN architecture now expects
+        # a score for every patch -- see attention_manifest.py for the CSV format.
+        if attention_manifest is None:
+            raise ValueError(
+                "attention_manifest is required: the GAN now conditions on per-patch "
+                "attention scores from your AB-MIL model, read from a manifest CSV "
+                "(see attention_manifest.py). Pass --attention_manifest."
+            )
+        score_lookup = load_attention_manifest(attention_manifest)
+        self.attention_scores = []
+        missing = []
+        
+        # --- MODIFIED: Bypass manifest lookup for Healthy slides ---
+        for (path, class_name), label_idx in zip(self.items, self.labels):
+            # If the patch belongs to Class 0 or the folder contains 'healthy',
+            # automatically assign 0.0 because they bypass AB-MIL scoring.
+            if label_idx == 0 or "healthy" in class_name.lower():
+                score = 0.0
+            else:
+                score = score_lookup.get(path.name)
+                if score is None:
+                    missing.append(path.name)
+                    score = attention_fallback if attention_fallback is not None else 0.0
+            
+            self.attention_scores.append(score)
+
+        if missing:
+            if attention_fallback is None:
+                raise ValueError(
+                    f"{len(missing)} of {len(self.items)} Tumor image(s) have no matching row "
+                    f"in {attention_manifest} (matched by filename) -- e.g. {missing[:5]}. "
+                    f"Either extend the manifest to cover every image, or pass "
+                    f"attention_fallback=<float> to use a fallback score for these."
+                )
+            print(f"[dataset] WARNING: {len(missing)} of {len(self.items)} Tumor image(s) had no "
+                  f"matching attention score -- used the fallback value {attention_fallback} "
+                  f"instead, e.g. {missing[:5]}")
+        else:
+            print(f"[dataset] Matched attention scores for all {len(self.items)} images "
+                  f"(range: {min(self.attention_scores):.4g} - {max(self.attention_scores):.4g})")
 
         self.augment = augment
         if self.augment:
@@ -167,7 +219,8 @@ class PatchDataset(Dataset):
             image_arr = self._augment(image_arr)
 
         label = self.class_to_idx[class_name]
+        attention_score = self.attention_scores[idx]
 
         image_t = torch.from_numpy(image_arr.astype(np.float32) / 127.5 - 1.0)
         image_t = image_t.permute(2, 0, 1).contiguous()  # CHW, scaled to [-1, 1]
-        return image_t, label
+        return image_t, label, torch.tensor(attention_score, dtype=torch.float32)

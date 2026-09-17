@@ -64,6 +64,18 @@ def parse_args():
     p.add_argument("--stain_target_image", type=str, default=None,
                     help="Reference image to normalize stain colors to. If unset, "
                          "the first image found in the dataset is used instead.")
+    p.add_argument("--attention_manifest", type=str, required=True,
+                    help="CSV mapping each patch image (by filename) to an AB-MIL "
+                         "attention score -- see attention_manifest.py. Required: G "
+                         "and D now condition on this alongside the class label.")
+    p.add_argument("--attention_fallback", type=float, default=None,
+                    help="Score to use for any image missing from --attention_manifest. "
+                         "Unset (default) means every image must have a matching row, "
+                         "or PatchDataset raises an error listing what's missing.")
+    p.add_argument("--attn_embed_dim", type=int, default=32,
+                    help="Size of the learned embedding the Generator projects the "
+                         "scalar attention score into (same role as the class-label "
+                         "embedding inside Generator, but for a continuous input).")
     # model / image size
     p.add_argument("--patch_size", type=int, default=None,
                     help="Output resolution. Defaults to auto-detect from the first "
@@ -139,15 +151,20 @@ def auto_device(requested=None):
     return torch.device("cpu")
 
 
-def save_sample_grid(generator, num_classes, samples_per_class, latent_dim, device, path):
-    """Generate a few patches per class and save them as one PNG grid (no torchvision dep)."""
+def save_sample_grid(generator, num_classes, samples_per_class, latent_dim, device, path,
+                      class_attn_scores):
+    """Generate a few patches per class and save them as one PNG grid (no torchvision dep).
+    class_attn_scores[c] is the representative attention score used for every sample in
+    class c's row (e.g. the mean score of real patches in that class) -- there's no
+    "real" score to condition on here since these are fully synthetic samples."""
     generator.eval()
     with torch.no_grad():
         rows = []
         for c in range(num_classes):
             z = torch.randn(samples_per_class, latent_dim, device=device)
             labels = torch.full((samples_per_class,), c, dtype=torch.long, device=device)
-            imgs = generator(z, labels).cpu()
+            attn = torch.full((samples_per_class,), float(class_attn_scores[c]), device=device)
+            imgs = generator(z, labels, attn).cpu()
             imgs = ((imgs.clamp(-1, 1) + 1) * 127.5).byte().permute(0, 2, 3, 1).numpy()  # NHWC uint8
             rows.append(imgs)
     generator.train()
@@ -223,17 +240,18 @@ def evaluate_fid(generator, dataloader, fid_metric, latent_dim, device, max_samp
     
     samples_processed = 0
     with torch.no_grad():
-        for real_imgs, labels in dataloader:
+        for real_imgs, labels, attn_scores in dataloader:
             if samples_processed >= max_samples:
                 break
                 
             real_imgs = real_imgs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
+            attn_scores = attn_scores.to(device, non_blocking=True)
             bs = real_imgs.size(0)
             
             # Generate fake images conditioned on the REAL labels (to match dataset distribution)
             z = torch.randn(bs, latent_dim, device=device)
-            fake_imgs = generator(z, labels)
+            fake_imgs = generator(z, labels, attn_scores)
             
             # TorchMetrics FID requires uint8 images in [0, 255]
             real_imgs_uint8 = ((real_imgs.clamp(-1, 1) + 1) * 127.5).byte()
@@ -300,11 +318,22 @@ def main():
         stain_normalize=args.stain_normalize,
         stain_method=args.stain_method,
         stain_target_image=args.stain_target_image,
+        attention_manifest=args.attention_manifest,
+        attention_fallback=args.attention_fallback,
     )
     args.num_classes = dataset.num_classes
 
+    # Representative attention score per class, used only for the fully-synthetic
+    # sample grid (there's no "real" score to condition on there) -- the mean score
+    # of that class's real patches.
+    labels_arr = np.asarray(dataset.labels)
+    scores_arr = np.asarray(dataset.attention_scores)
+    class_attn_scores = [float(scores_arr[labels_arr == c].mean()) for c in range(dataset.num_classes)]
+    logger.info(f"[train] Representative attention score per class (used for sample "
+                f"grids): {dict(zip(dataset.class_names, class_attn_scores))}")
+
     if args.patch_size is None:
-        sample_img, _ = dataset[0]
+        sample_img, _, _ = dataset[0]
         args.patch_size = sample_img.shape[-1]
         print(f"[train] --patch_size not set, auto-detected {args.patch_size} "
               f"from the first image in your dataset.")
@@ -326,6 +355,7 @@ def main():
                          pin_memory=(device.type == "cuda"))
 
     G = Generator(latent_dim=args.latent_dim, num_classes=args.num_classes,
+                  attn_embed_dim=args.attn_embed_dim,
                   patch_size=args.patch_size, base_channels=args.g_base_channels).to(device)
     D = Discriminator(num_classes=args.num_classes, patch_size=args.patch_size,
                        base_channels=args.d_base_channels,
@@ -411,9 +441,10 @@ def main():
                 total_batches = None
             batch_iter = tqdm(loader, desc=f"epoch {epoch+1}", total=total_batches, leave=False)
 
-        for real_imgs, labels in batch_iter:
+        for real_imgs, labels, attn_scores in batch_iter:
             real_imgs = real_imgs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
+            attn_scores = attn_scores.to(device, non_blocking=True)
             bs = real_imgs.size(0)
 
             real_target = torch.full((bs, 1), args.label_smoothing, device=device)
@@ -423,7 +454,7 @@ def main():
             opt_d.zero_grad(set_to_none=True)
             z = torch.randn(bs, args.latent_dim, device=device)
             with torch.no_grad():
-                fake_imgs = G(z, labels)
+                fake_imgs = G(z, labels, attn_scores)
 
             # --- ADDED FOR R1 PENALTY ---
             apply_r1 = args.r1_gamma > 0 and (global_step % args.r1_every == 0)
@@ -431,8 +462,8 @@ def main():
                 real_imgs.requires_grad_(True)
             # ---------------------
 
-            d_real = D(real_imgs, labels)
-            d_fake = D(fake_imgs, labels)
+            d_real = D(real_imgs, labels, attn_scores)
+            d_fake = D(fake_imgs, labels, attn_scores)
             d_loss = criterion(d_real, real_target) + criterion(d_fake, fake_target)
 
             # --- ADDED FOR R1 PENALTY ---
@@ -451,8 +482,8 @@ def main():
             # --- Generator step ---
             opt_g.zero_grad(set_to_none=True)
             z = torch.randn(bs, args.latent_dim, device=device)
-            fake_imgs = G(z, labels)
-            d_fake_for_g = D(fake_imgs, labels)
+            fake_imgs = G(z, labels, attn_scores)
+            d_fake_for_g = D(fake_imgs, labels, attn_scores)
             g_loss = criterion(d_fake_for_g, torch.full((bs, 1), 1.0, device=device))
             g_loss.backward()
             opt_g.step()
@@ -516,7 +547,7 @@ def main():
         if (epoch + 1) % args.sample_every == 0:
             sample_path = out_dir / "samples" / f"epoch_{epoch+1:04d}.png"
             save_sample_grid(G_ema, args.num_classes, args.samples_per_class,
-                              args.latent_dim, device, sample_path)
+                              args.latent_dim, device, sample_path, class_attn_scores)
             logger.info(f"  saved sample grid (EMA) -> {sample_path}")
 
         # GITHUB LOGGING
