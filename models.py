@@ -1,23 +1,29 @@
 """
 models.py — a basic class-conditional DCGAN, sized dynamically for any target patch_size.
-Now features a Projected GAN architecture for the Discriminator.
 
 Generator: latent vector + class embedding -> project to a small 4x4 feature map ->
 repeated Upsample(nearest)+Conv2d blocks (each doubles spatial size, halves channels)
-until we reach or exceed patch_size.
+until we reach or exceed patch_size -> a final resize + refinement conv locks in the
+exact requested size (so patch_size doesn't need to be a power of two). We use
+Upsample+Conv2d rather than ConvTranspose2d specifically to avoid the checkerboard
+artifacts transposed convolutions are known to produce (uneven kernel overlap) --
+this was showing up clearly in earlier sample grids.
 
-Discriminator (Projected): Passes both real and fake images through a frozen, 
-pretrained DenseNet201 backbone to extract robust texture features (ImageNet-normalized).
-The class label embedding is broadcast and concatenated to these features, which are 
-then passed through a small, trainable CNN head with Spectral Norm and Minibatch-StdDev 
-to evaluate realness. This prevents mode collapse while massively accelerating learning.
+Discriminator: mirrors this with strided Conv2d blocks, conditioned on class by
+concatenating a constant per-class channel to the image. A minibatch-stddev layer is
+inserted before the final classifier: it appends one extra channel containing the
+batch's feature stddev, so the discriminator can directly notice when a whole batch of
+generator outputs looks suspiciously uniform -- a direct countermeasure against mode
+collapse. AdaptiveAvgPool2d at the end means the whole thing also works for any
+patch_size without manual size bookkeeping. Spectral norm is applied to the conv/linear
+layers by default -- it's a one-line addition that meaningfully helps stability once
+you push resolution up (e.g. towards 512x512), which plain DCGAN struggles with.
 """
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as models
 
 
 def num_upsample_blocks(target_size: int, base_size: int = 4) -> int:
@@ -77,7 +83,11 @@ class Generator(nn.Module):
 
 class MinibatchStdDev(nn.Module):
     """Appends one extra channel containing the batch's feature-map stddev, averaged
-    down to a single scalar and broadcast spatially. Countermeasure against mode collapse."""
+    down to a single scalar and broadcast spatially. Simplified (single-group) version
+    of the ProGAN/StyleGAN minibatch-stddev layer -- lets the discriminator directly
+    notice when a whole batch of generator outputs is suspiciously uniform, which is
+    exactly what mode collapse looks like."""
+
     def __init__(self, eps=1e-8):
         super().__init__()
         self.eps = eps
@@ -97,38 +107,16 @@ class Discriminator(nn.Module):
         def sn(module):
             return nn.utils.spectral_norm(module) if use_spectral_norm else module
 
-        # --- PRETRAINED BACKBONE (FROZEN) ---
-        densenet = models.densenet201(weights=models.DenseNet201_Weights.IMAGENET1K_V1).features
-        
-        # Slice up to transition1 (inclusive) to get mid-level texture features
-        # Structure: 0:conv0, 1:norm0, 2:relu0, 3:pool0, 4:denseblock1, 5:transition1
-        self.backbone = nn.Sequential(*list(densenet.children())[:6])
-        
-        # CRITICAL: Freeze the backbone weights to save VRAM and prevent them from changing
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-            
-        # ImageNet normalization tensors for the GAN inputs (which are in [-1, 1])
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-        
-        # DenseNet201 [:6] slice always outputs exactly 128 channels. 
-        backbone_out_ch = 128
-        
-        # --- TRAINABLE HEAD ---
-        # 1 learned scalar per class, broadcast as an extra constant channel over the feature map
+        # one learned scalar per class, broadcast as an extra constant channel
         self.label_embed = nn.Embedding(num_classes, 1)
 
-        in_ch = backbone_out_ch + 1  # 128 DenseNet channels + 1 Class Label channel
-        
+        in_ch = img_channels + 1
         blocks = [
-            sn(nn.Conv2d(in_ch, base_channels * 2, kernel_size=3, stride=1, padding=1)),
+            sn(nn.Conv2d(in_ch, base_channels, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
         ]
-        
-        ch = base_channels * 2
-        # We start at patch_size // 8 due to DenseNet's internal pooling (pool0 + transition1)
-        cur_size = patch_size // 8 
+        ch = base_channels
+        cur_size = patch_size // 2
         while cur_size > min_spatial:
             out_ch = min(ch * 2, max_channels)
             blocks += [
@@ -138,34 +126,15 @@ class Discriminator(nn.Module):
             ]
             ch = out_ch
             cur_size //= 2
-            
         self.features = nn.Sequential(*blocks)
         self.minibatch_stddev = MinibatchStdDev()
         self.pool = nn.AdaptiveAvgPool2d(min_spatial)
-        # +1 input channel because minibatch_stddev layer appends one extra feature map
+        # +1 input channel: the minibatch-stddev layer appends one extra feature map
         self.classifier = sn(nn.Linear((ch + 1) * min_spatial * min_spatial, 1))
 
-    def train(self, mode=True):
-        """Override train to ensure the frozen DenseNet backbone always stays in eval mode."""
-        super().train(mode)
-        self.backbone.eval()
-        return self
-
     def forward(self, img, labels):
-        # 1. Normalize GAN outputs from [-1, 1] to ImageNet [0, 1] standard
-        x = (img + 1.0) / 2.0
-        x = (x - self.mean) / self.std
-        
-        # 2. Extract features through frozen DenseNet
-        # (Notice there is NO torch.no_grad() here. We need gradients to pass 
-        # *through* the backbone so the Generator can learn from them).
-        x = self.backbone(x)
-        
-        # 3. Inject the Class Embedding as an extra spatial channel
-        y = self.label_embed(labels).view(-1, 1, 1, 1).expand(-1, 1, x.shape[2], x.shape[3])
-        x = torch.cat([x, y], dim=1)
-        
-        # 4. Trainable Head
+        y = self.label_embed(labels).view(-1, 1, 1, 1).expand(-1, 1, img.shape[2], img.shape[3])
+        x = torch.cat([img, y], dim=1)
         x = self.features(x)
         x = self.minibatch_stddev(x)
         x = self.pool(x)

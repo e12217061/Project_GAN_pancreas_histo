@@ -48,5 +48,33 @@ Inception Score:    3.4861 ± 0.0522
 =============================================
 
 
-DCGAN trained on 2 class w/ data-aug & stain-norm (abmil_train_mixed) with abmil 60% top - 40% center attention score selection
-(generation of 12k, 52k)
+DCGAN trained on 2 class w/ data-aug (train) with abmil 60% top - 40% center attention score selection and 80k tumor , 20k healthy
+(generation of 25k, 25k)
+
+
+=============================================
+FINAL EVALUATION METRICS
+=============================================
+FID Score:          30.6864
+KID Score:          0.016174 ± 0.006933
+Inception Score:    2.6261 ± 0.0147
+=============================================
+
+no data aug 
+=============================================
+FINAL EVALUATION METRICS
+=============================================
+FID Score:          31.3954
+KID Score:          0.016035 ± 0.007106
+Inception Score:    2.4530 ± 0.0191
+
+
+
+with data aug 
+=============================================
+FINAL EVALUATION METRICS
+=============================================
+FID Score:          19.9998
+KID Score:          0.007673 ± 0.005077
+Inception Score:    2.6414 ± 0.0280
+=============================================

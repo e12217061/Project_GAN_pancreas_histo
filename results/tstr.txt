@@ -57,5 +57,29 @@ F1                 | 0.9992        | 0.7989        | 0.2003
 
 
 
+TSTR run with abmil dataset (80k,20k) and syn 25k each
+
+Accuracy:          0.7982
+Balanced Accuracy: 0.8769
+Macro F1 Score:    0.7316
+Confusion Matrix:
+[[ 3580    37]
+ [ 4779 15471]]
 
 
+
+TSTR run without data aug
+
+ Accuracy:          0.9983
+Balanced Accuracy: 0.9977
+Macro F1 Score:    0.9975
+Confusion Matrix:
+[[ 3605    12]
+ [   16 12839]]
+
+Accuracy:          0.8590
+Balanced Accuracy: 0.8919
+Macro F1 Score:    0.8249
+Confusion Matrix:
+[[ 3438   179]
+ [ 2143 10712]]
