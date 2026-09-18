@@ -16,3 +16,5 @@ ambil_train_mixed/
 train/
 test/
 train_abmil/
+synthetic-dataset/
+normalized_images/
